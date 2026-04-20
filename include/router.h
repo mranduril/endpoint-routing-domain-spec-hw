@@ -4,7 +4,8 @@
 #include "job.h"
 #include "workload_type.h"
 #include <cstddef>
-#include <iostream>
+#include <unordered_map>
+#include <string>
 
 namespace Routing {
 
@@ -46,10 +47,19 @@ enum class RoutingPolicy {
     ForceSim
 };
 
+inline std::unordered_map<RoutingPolicy, std::string> RoutingPolicyNames = {
+    {RoutingPolicy::Auto, "Auto"},
+    {RoutingPolicy::ForceCpu, "ForceCpu"},
+    {RoutingPolicy::ForceGpu, "ForceGpu"},
+    {RoutingPolicy::ForceSplit, "ForceSplit"},
+    {RoutingPolicy::ForceSim, "ForceSim"}
+};
+
 struct RouterConfig {
     double cpu_alpha = 1.0;
     double gpu_launch = 1000.0;
     double gpu_alpha = 0.2;
+    double gpu_transfer_alpha = 0.5;
     double sim_startup = 5000.0;
     double sim_alpha = 2.0;
 };

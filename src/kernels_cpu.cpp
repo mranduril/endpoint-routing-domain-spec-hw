@@ -14,15 +14,6 @@ namespace Routing
         }
     }
 
-    void saxpy_gpu_only(float a, std::size_t n, const float* x, float* y)
-    {
-        (void)a;
-        (void)n;
-        (void)x;
-        (void)y;
-        throw std::logic_error("GPU SAXPY endpoint is not implemented yet");
-    }
-
     void saxpy_simpy(float a, std::size_t n, const float* x, float* y)
     {
         (void)a;

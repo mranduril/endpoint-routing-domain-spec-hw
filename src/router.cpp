@@ -10,6 +10,7 @@ DispatchPlan make_cpu_plan(std::size_t n, double estimated_cost)
 {
     DispatchPlan plan{};
     plan.kind = DispatchKind::CpuOnly;
+    plan.node_kind = NodeKind::Local;
     plan.cpu_begin = 0;
     plan.cpu_end = n;
     plan.gpu_begin = 0;
@@ -22,6 +23,7 @@ DispatchPlan make_gpu_plan(std::size_t n, double estimated_cost)
 {
     DispatchPlan plan{};
     plan.kind = DispatchKind::GpuOnly;
+    plan.node_kind = NodeKind::Local;
     plan.cpu_begin = 0;
     plan.cpu_end = 0;
     plan.gpu_begin = 0;
@@ -35,6 +37,7 @@ DispatchPlan make_split_plan(std::size_t n, double estimated_cost)
     const std::size_t split = n / 2;
     DispatchPlan plan{};
     plan.kind = DispatchKind::CpuGpuSplit;
+    plan.node_kind = NodeKind::Local;
     plan.cpu_begin = 0;
     plan.cpu_end = split;
     plan.gpu_begin = split;
@@ -47,6 +50,7 @@ DispatchPlan make_sim_plan(std::size_t n, double estimated_cost)
 {
     DispatchPlan plan{};
     plan.kind = DispatchKind::SimOnly;
+    plan.node_kind = NodeKind::Local;
     plan.cpu_begin = 0;
     plan.cpu_end = 0;
     plan.gpu_begin = 0;
@@ -61,10 +65,13 @@ double estimate_split_cost(const payloadSAXPY& payload, const RouterConfig& conf
 {
     const std::size_t cpu_work = payload.n / 2;
     const std::size_t gpu_work = payload.n - cpu_work;
+    constexpr std::size_t saxpy_transfer_copies = 3; // x H2D, y H2D, y D2H
 
     const double cpu_cost = config.cpu_alpha * static_cast<double>(cpu_work);
     const double gpu_cost = config.gpu_launch +
-        config.gpu_alpha * static_cast<double>(gpu_work);
+        config.gpu_alpha * static_cast<double>(gpu_work) +
+        config.gpu_transfer_alpha * static_cast<double>(gpu_work) *
+            (sizeof(float) * saxpy_transfer_copies);
 
     // Simple overlap model: both endpoints work in parallel on their slices.
     return std::max(cpu_cost, gpu_cost);
@@ -136,8 +143,9 @@ double Router::estimate_cpu(const payloadSAXPY& payload) const
 
 double Router::estimate_gpu(const payloadSAXPY& payload) const
 {
-    return config_.gpu_launch +
-        config_.gpu_alpha * static_cast<double>(payload.n);
+    return config_.gpu_launch
+        + config_.gpu_alpha * static_cast<double>(payload.n)
+        + config_.gpu_transfer_alpha * static_cast<double>(payload.n) * (sizeof(float) * 3); // Account for 2 h2d and 1 d2h transfers
 }
 
 double Router::estimate_sim(const payloadSAXPY& payload) const
