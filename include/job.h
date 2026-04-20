@@ -13,7 +13,14 @@ namespace Routing
         WorkloadType type;  // Carries the type of workload
         std::variant<payloadSAXPY> payload; // Add more payload types as needed
 
-        bool validate();
+        bool validate() const;
     };
+    
+    Job make_saxpy(
+        float a,
+        std::shared_ptr<const std::vector<float>> x,
+        std::shared_ptr<std::vector<float>> y
+    );
 }
+
 #endif // job.h

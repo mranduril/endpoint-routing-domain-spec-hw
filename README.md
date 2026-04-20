@@ -1,3 +1,12 @@
+## Cost model assumption
+cost(endpoint, job) = transfer_cost + queue_delay + execution_cost
+
+cost_cpu(n) = alpha_cpu * n
+cost_gpu(n) = launch_gpu + alpha_gpu * n + h2d_cost(n) + d2h_cost(n)
+cost_sim(n) = startup_sim + alpha_sim * n + queue_delay + h2d_cost(n) + d2h_cost(n)
+
+n: Problem size; alpha_cpu
+
 ## Project direction
 
 I shifted from the original **GPU + Vortex FPGA + BlueField** idea to a more feasible **endpoint-routing runtime** project.

@@ -1,11 +1,10 @@
 #ifndef ROUTER_H
 #define ROUTER_H
 
-#pragma once
-
 #include "job.h"
 #include "workload_type.h"
 #include <cstddef>
+#include <iostream>
 
 namespace Routing {
 
@@ -16,6 +15,11 @@ enum class DispatchKind {
     SimOnly
 };
 
+enum class NodeKind {
+    Local,
+    Remote
+};
+
 enum class EndpointKind {
     CPU,
     GPU,
@@ -23,11 +27,14 @@ enum class EndpointKind {
 };
 
 struct DispatchPlan {
+    NodeKind node_kind;
     DispatchKind kind;
     std::size_t cpu_begin = 0;
     std::size_t cpu_end = 0;
     std::size_t gpu_begin = 0;
     std::size_t gpu_end = 0;
+    std::size_t sim_begin = 0;
+    std::size_t sim_end = 0;
     double estimated_cost = 0.0;
 };
 
