@@ -77,6 +77,25 @@ double estimate_split_cost(const payloadSAXPY& payload, const RouterConfig& conf
     return std::max(cpu_cost, gpu_cost);
 }
 
+std::size_t jacobi_work_units(const payloadJacobi& payload, WorkloadType type)
+{
+    if (type == WorkloadType::JACOBI_INTERIOR) {
+        const std::size_t width = payload.nx > 2 * payload.halo_width ?
+            payload.nx - 2 * payload.halo_width : 0;
+        const std::size_t height = payload.ny > 2 * payload.halo_width ?
+            payload.ny - 2 * payload.halo_width : 0;
+        return width * height;
+    }
+
+    const std::size_t horizontal =
+        std::min(2 * payload.halo_width, payload.ny) * payload.nx;
+    const std::size_t vertical =
+        (payload.ny > 2 * payload.halo_width ?
+            payload.ny - 2 * payload.halo_width : 0) *
+        std::min(2 * payload.halo_width, payload.nx);
+    return horizontal + vertical;
+}
+
 Router::Router(RouterConfig config)
     : config_(config)
 {
@@ -94,8 +113,54 @@ DispatchPlan Router::plan(const Job& job, RoutingPolicy policy) const
                 throw std::invalid_argument("Job payload does not match SAXPY workload");
             }
             return plan_saxpy(std::get<payloadSAXPY>(job.payload), policy);
+        case WorkloadType::JACOBI_INTERIOR:
+        case WorkloadType::JACOBI_BOUNDARY:
+        case WorkloadType::JACOBI_HALO_BOUNDARY:
+            if (!std::holds_alternative<payloadJacobi>(job.payload)) {
+                throw std::invalid_argument("Job payload does not match Jacobi workload");
+            }
+            return plan_jacobi(std::get<payloadJacobi>(job.payload), job.type, policy);
         default:
             throw std::invalid_argument("Router does not support this workload yet");
+    }
+}
+
+DispatchPlan Router::plan_jacobi(
+    const payloadJacobi& payload,
+    WorkloadType type,
+    RoutingPolicy policy) const
+{
+    const std::size_t work_units = jacobi_work_units(payload, type);
+    const double cpu_cost = estimate_cpu(payload);
+    const double gpu_cost = estimate_gpu(payload);
+    const double sim_cost = estimate_sim(payload);
+
+    switch (policy) {
+        case RoutingPolicy::ForceCpu:
+            return make_cpu_plan(work_units, cpu_cost);
+        case RoutingPolicy::ForceGpu:
+            return make_gpu_plan(work_units, gpu_cost);
+        case RoutingPolicy::ForceSim:
+            return make_sim_plan(work_units, sim_cost);
+        case RoutingPolicy::ForceSplit:
+            return make_split_plan(work_units, std::max(cpu_cost, gpu_cost));
+        case RoutingPolicy::Auto:
+        default: {
+            DispatchPlan best_plan = make_cpu_plan(work_units, cpu_cost);
+
+            // Boundary work is the useful SIM endpoint story; interior work can use GPU.
+            if (type == WorkloadType::JACOBI_INTERIOR &&
+                gpu_cost < best_plan.estimated_cost) {
+                best_plan = make_gpu_plan(work_units, gpu_cost);
+            }
+
+            if (type != WorkloadType::JACOBI_INTERIOR &&
+                sim_cost < best_plan.estimated_cost) {
+                best_plan = make_sim_plan(work_units, sim_cost);
+            }
+
+            return best_plan;
+        }
     }
 }
 
@@ -152,6 +217,26 @@ double Router::estimate_sim(const payloadSAXPY& payload) const
 {
     return config_.sim_startup +
         config_.sim_alpha * static_cast<double>(payload.n);
+}
+
+double Router::estimate_cpu(const payloadJacobi& payload) const
+{
+    return config_.cpu_alpha * static_cast<double>(payload.nx * payload.ny);
+}
+
+double Router::estimate_gpu(const payloadJacobi& payload) const
+{
+    constexpr std::size_t input_output_copies = 2;
+    return config_.gpu_launch
+        + config_.gpu_alpha * static_cast<double>(payload.nx * payload.ny)
+        + config_.gpu_transfer_alpha * static_cast<double>(payload.nx * payload.ny) *
+            (sizeof(float) * input_output_copies);
+}
+
+double Router::estimate_sim(const payloadJacobi& payload) const
+{
+    const std::size_t cells = payload.nx * payload.ny;
+    return config_.sim_startup + config_.sim_alpha * static_cast<double>(cells);
 }
 
 } // namespace Routing

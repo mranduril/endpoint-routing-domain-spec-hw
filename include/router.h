@@ -75,10 +75,16 @@ private:
 
     DispatchPlan plan_saxpy(const payloadSAXPY& payload,
                             RoutingPolicy policy) const;
+    DispatchPlan plan_jacobi(const payloadJacobi& payload,
+                             WorkloadType type,
+                             RoutingPolicy policy) const;
 
     double estimate_cpu(const payloadSAXPY& payload) const;
     double estimate_gpu(const payloadSAXPY& payload) const;
     double estimate_sim(const payloadSAXPY& payload) const;
+    double estimate_cpu(const payloadJacobi& payload) const;
+    double estimate_gpu(const payloadJacobi& payload) const;
+    double estimate_sim(const payloadJacobi& payload) const;
 };
 
 } // namespace Routing

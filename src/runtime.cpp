@@ -3,13 +3,105 @@
 #include "kernels.h"
 
 #include <exception>
+#include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <variant>
+#include <sys/stat.h>
 
 namespace Routing
 {
+namespace
+{
+std::string workload_name(WorkloadType type)
+{
+    switch (type) {
+        case WorkloadType::SAXPY:
+            return "SAXPY";
+        case WorkloadType::JACOBI_INTERIOR:
+            return "JACOBI_INTERIOR";
+        case WorkloadType::JACOBI_BOUNDARY:
+            return "JACOBI_BOUNDARY";
+        case WorkloadType::JACOBI_HALO_BOUNDARY:
+            return "JACOBI_HALO_BOUNDARY";
+        default:
+            return "NOT_SUPPORTED";
+    }
+}
+
+const char* sim_trace_path()
+{
+    const char* configured = std::getenv("ROUTING_SIM_TRACE");
+    return configured != nullptr ? configured : "traces/sim_jobs.jsonl";
+}
+
+void ensure_default_trace_dir()
+{
+    const char* configured = std::getenv("ROUTING_SIM_TRACE");
+    if (configured == nullptr) {
+        mkdir("traces", 0775);
+    }
+}
+
+void emit_sim_trace_record(const Job& job)
+{
+    ensure_default_trace_dir();
+    std::ofstream trace(sim_trace_path(), std::ios::app);
+    if (!trace) {
+        throw std::runtime_error("Failed to open SIM trace output");
+    }
+
+    trace << "{\"job_id\":" << job.metadata.job_id
+          << ",\"node_id\":" << job.metadata.node_id
+          << ",\"endpoint\":\"SIM" << job.metadata.node_id << "\""
+          << ",\"op\":\"" << workload_name(job.type) << "\""
+          << ",\"arrival_us\":" << job.metadata.arrival_us;
+
+    if (std::holds_alternative<payloadSAXPY>(job.payload)) {
+        const auto& saxpy = std::get<payloadSAXPY>(job.payload);
+        trace << ",\"n\":" << saxpy.n
+              << ",\"input_bytes\":" << saxpy.n * sizeof(float) * 2
+              << ",\"output_bytes\":" << saxpy.n * sizeof(float)
+              << ",\"metadata\":{\"dtype\":\"float32\",\"layout\":\"contiguous\"}";
+    } else if (std::holds_alternative<payloadJacobi>(job.payload)) {
+        const auto& jacobi = std::get<payloadJacobi>(job.payload);
+        const std::size_t grid_bytes = jacobi.nx * jacobi.ny * sizeof(float);
+        trace << ",\"nx\":" << jacobi.nx
+              << ",\"ny\":" << jacobi.ny
+              << ",\"halo_width\":" << jacobi.halo_width
+              << ",\"input_bytes\":" << grid_bytes
+              << ",\"output_bytes\":" << grid_bytes
+              << ",\"metadata\":{\"stencil\":\"2d_5pt\",\"dtype\":\"float32\","
+              << "\"layout\":\"row_major\",\"iteration\":" << job.metadata.iteration
+              << ",\"neighbor_node_id\":" << job.metadata.neighbor_node_id << "}";
+    }
+
+    trace << "}\n";
+}
+
+void run_jacobi_cpu(WorkloadType type, const payloadJacobi& jacobi)
+{
+    if (type == WorkloadType::JACOBI_INTERIOR) {
+        jacobi_interior_cpu(
+            jacobi.nx,
+            jacobi.ny,
+            jacobi.halo_width,
+            jacobi.input->data(),
+            jacobi.output->data());
+        return;
+    }
+
+    jacobi_boundary_cpu(
+        jacobi.nx,
+        jacobi.ny,
+        jacobi.halo_width,
+        jacobi.input->data(),
+        jacobi.output->data());
+}
+}
 
 void Request::wait()
 {
@@ -129,8 +221,42 @@ Request submit(Job job, RoutingPolicy policy)
                             }
                             break;
                         }
+                        case DispatchKind::SimOnly:
+                            emit_sim_trace_record(state->job);
+                            break;
                         default:
                             throw std::logic_error("Selected dispatch plan is not implemented yet");
+                    }
+                    break;
+                }
+                case WorkloadType::JACOBI_INTERIOR:
+                case WorkloadType::JACOBI_BOUNDARY:
+                case WorkloadType::JACOBI_HALO_BOUNDARY: {
+                    if (!std::holds_alternative<payloadJacobi>(state->job.payload)) {
+                        throw std::invalid_argument("Job payload does not match Jacobi workload");
+                    }
+
+                    auto& jacobi = std::get<payloadJacobi>(state->job.payload);
+                    switch (state->plan.kind) {
+                        case DispatchKind::CpuOnly:
+                            run_jacobi_cpu(state->job.type, jacobi);
+                            break;
+                        case DispatchKind::GpuOnly:
+                            if (state->job.type != WorkloadType::JACOBI_INTERIOR) {
+                                throw std::logic_error("GPU Jacobi boundary path is not implemented yet");
+                            }
+                            jacobi_interior_gpu(
+                                jacobi.nx,
+                                jacobi.ny,
+                                jacobi.halo_width,
+                                jacobi.input->data(),
+                                jacobi.output->data());
+                            break;
+                        case DispatchKind::SimOnly:
+                            emit_sim_trace_record(state->job);
+                            break;
+                        default:
+                            throw std::logic_error("Selected Jacobi dispatch plan is not implemented yet");
                     }
                     break;
                 }
@@ -157,6 +283,10 @@ Request submit(Job job, RoutingPolicy policy)
 }
 
 void Request::inspect_dispatch_plan() {
+    if (!state_) {
+        throw std::invalid_argument("Cannot inspect an invalid request");
+    }
+
     std::cout << "Dispatch Plan:" << std::endl;
     std::cout << "  Node Kind: " << (state_->plan.node_kind == NodeKind::Local ? "Local" : "Remote") << std::endl;
     std::cout << "  Dispatch Kind: ";

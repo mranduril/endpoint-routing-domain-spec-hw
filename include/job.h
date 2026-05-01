@@ -11,7 +11,8 @@ namespace Routing
     struct Job
     {
         WorkloadType type;  // Carries the type of workload
-        std::variant<payloadSAXPY> payload; // Add more payload types as needed
+        JobMetadata metadata;
+        std::variant<payloadSAXPY, payloadJacobi> payload;
 
         bool validate() const;
     };
@@ -20,6 +21,16 @@ namespace Routing
         float a,
         std::shared_ptr<const std::vector<float>> x,
         std::shared_ptr<std::vector<float>> y
+    );
+
+    Job make_jacobi(
+        WorkloadType type,
+        std::size_t nx,
+        std::size_t ny,
+        std::size_t halo_width,
+        std::shared_ptr<const std::vector<float>> input,
+        std::shared_ptr<std::vector<float>> output,
+        JobMetadata metadata = {}
     );
 }
 
