@@ -1,3 +1,481 @@
+## 05/01/26
+In the 2-node Jacobi setup, I would make the **SimPy endpoint represent a stencil-specialized streaming accelerator**, not a generic “faster CPU.”
+
+That fits your story best because Jacobi stencil is regular, memory-streaming, and local-neighborhood based — exactly the kind of workload that could plausibly be implemented as an FPGA pipeline or ASIC stencil engine.
+
+## Recommended SimPy role
+
+Each node has:
+
+```text
+Node 0: CPU0 + GPU0 + SIM0
+Node 1: CPU1 + GPU1 + SIM1
+```
+
+The SimPy process models a local domain-specific accelerator:
+
+```text
+SIM endpoint = stencil streaming engine
+```
+
+It does **not** replace MPI. It does **not** own the whole distributed program. It is just another execution endpoint that can run certain stencil-related jobs.
+
+---
+
+# Best hardware assumption: streaming stencil engine
+
+Assume the simulated hardware is a **fixed-function or semi-programmable stencil pipeline**.
+
+It supports operations like:
+
+```text
+out[i][j] = c0 * in[i][j]
+          + c1 * in[i-1][j]
+          + c2 * in[i+1][j]
+          + c3 * in[i][j-1]
+          + c4 * in[i][j+1]
+```
+
+For Jacobi, this is perfect.
+
+## What the hardware is good at
+
+It is good at:
+
+* regular 1D/2D stencil update
+* contiguous tiles
+* streaming rows through line buffers
+* repeated iterations with same coefficients
+* high throughput after startup
+* deterministic execution time
+
+## What it is bad at
+
+It is bad at:
+
+* irregular boundaries
+* dynamic control flow
+* arbitrary kernels
+* tiny tiles
+* data not laid out contiguously
+* complicated synchronization
+
+That gives the router real decisions to make.
+
+---
+
+# Where SimPy fits in the Jacobi pipeline
+
+A Jacobi iteration can be decomposed into jobs:
+
+```text
+1. Halo pack
+2. Halo exchange
+3. Interior update
+4. Border update
+5. Halo unpack / boundary handling
+```
+
+Now assign possible endpoints:
+
+| Job               | CPU |   GPU | SimPy stencil engine |
+| ----------------- | --: | ----: | -------------------: |
+| Interior update   | yes |   yes |      yes, strong fit |
+| Border update     | yes |   yes |      maybe, weak fit |
+| Halo pack/unpack  | yes | maybe |            no / weak |
+| MPI halo exchange | yes |    no |                   no |
+| Coefficient setup | yes |    no |                maybe |
+
+The cleanest SimPy role is:
+
+> **SimPy accelerates the interior stencil update on each node’s local subdomain.**
+
+That is the most believable and easiest to model.
+
+---
+
+# Hardware aspects you can simulate
+
+## 1. Startup / configuration latency
+
+The accelerator must be configured with:
+
+* grid dimensions
+* stencil coefficients
+* input/output buffer addresses
+* tile shape
+
+So model:
+
+```text
+config_latency_us
+```
+
+This makes CPU preferable for tiny tiles.
+
+---
+
+## 2. Streaming throughput
+
+After startup, it processes cells at a fixed rate:
+
+```text
+cells_per_us
+```
+
+For a tile with (N) interior cells:
+
+```text
+exec_time = config_latency + N / cells_per_us
+```
+
+This is the core SimPy service model.
+
+---
+
+## 3. Line-buffer / tile constraints
+
+A real stencil engine would use line buffers or scratchpad memory.
+
+Model:
+
+* maximum tile width
+* maximum tile height
+* maximum tile cells
+* chunking overhead if tile is too large
+
+Example:
+
+```text
+if tile_bytes > local_buffer_capacity:
+    split into chunks
+    add chunk_boundary_overhead
+```
+
+This makes the simulated hardware realistic.
+
+---
+
+## 4. Host-mediated data movement
+
+Assume the accelerator is attached through PCIe or a host-visible DMA interface.
+
+So it has transfer costs:
+
+```text
+input_transfer_time  = input_bytes / input_bandwidth
+output_transfer_time = output_bytes / output_bandwidth
+```
+
+For a stencil tile, input bytes are slightly larger than output bytes because you need halo rows/columns:
+
+```text
+input tile = interior + ghost boundary
+output tile = updated interior
+```
+
+This is important because a stencil accelerator may be compute-fast but data-movement-limited.
+
+---
+
+## 5. Limited concurrency
+
+Assume each SimPy endpoint has:
+
+* one stencil pipeline, or
+* two pipelines
+
+Model it with a SimPy `Resource(capacity=1)` or `capacity=2`.
+
+This creates queueing delay:
+
+```text
+sim_cost = queue_delay + transfer_in + config + compute + transfer_out
+```
+
+---
+
+## 6. Supported stencil radius
+
+Make it support only:
+
+* radius-1 5-point stencil, or
+* maybe radius-1 7-point if 3D later
+
+For MVP:
+
+```text
+supported_ops = {JACOBI_2D_5PT_INTERIOR}
+```
+
+Unsupported jobs fall back to CPU/GPU.
+
+That makes it domain-specific.
+
+---
+
+# How the router uses SimPy
+
+For each stencil sub-job, the router estimates:
+
+```text
+cost_cpu(tile)
+cost_gpu(tile)
+cost_sim(tile)
+```
+
+Then picks the cheapest endpoint.
+
+For interior tile:
+
+```text
+cost_sim =
+    sim_queue_delay
+  + input_bytes / sim_input_bw
+  + sim_config_latency
+  + num_cells / sim_cells_per_us
+  + output_bytes / sim_output_bw
+```
+
+For GPU:
+
+```text
+cost_gpu =
+    h2d_if_needed
+  + cuda_launch_latency
+  + num_cells / gpu_cells_per_us
+  + d2h_if_needed
+```
+
+For CPU:
+
+```text
+cost_cpu =
+    num_cells / cpu_cells_per_us
+```
+
+For two nodes, add halo communication outside the local endpoint cost:
+
+```text
+iteration_cost =
+    local_compute_cost
+  + halo_exchange_cost
+  + sync_cost
+```
+
+Or, if you overlap interior compute with halo exchange:
+
+```text
+iteration_cost =
+    max(interior_compute_cost, halo_exchange_cost)
+  + border_compute_cost
+  + sync_cost
+```
+
+That overlap formula is very useful for your report.
+
+---
+
+# Best decomposition for your POC
+
+I would implement the Jacobi iteration like this:
+
+```text
+for each timestep:
+    1. start halo exchange
+    2. route INTERIOR_UPDATE job
+    3. wait for halo
+    4. route BORDER_UPDATE job
+    5. swap buffers
+```
+
+Now SimPy can be useful:
+
+```text
+INTERIOR_UPDATE -> candidate endpoints: CPU, GPU, SIM
+BORDER_UPDATE   -> candidate endpoints: CPU, GPU
+HALO_EXCHANGE   -> MPI only
+```
+
+This is very elegant.
+
+The SimPy endpoint does not need to handle border cells. That avoids boundary-condition complexity.
+
+---
+
+# Why this is better than making SimPy a whole-node accelerator
+
+Do **not** make SimPy “run the whole Jacobi iteration.”
+
+That would hide the compiler/runtime decision.
+
+Instead, make it an endpoint for a specific operator:
+
+```text
+JACOBI_INTERIOR_TILE
+```
+
+Then your router has meaningful decisions:
+
+* CPU for small border jobs
+* GPU for large general tiles
+* SIM for supported regular interior tiles
+* MPI for halo exchange
+
+This is much more compiler-like.
+
+---
+
+# What assumptions are “big-brain but realistic”?
+
+Here is a strong assumption set:
+
+## SimPy endpoint = FPGA-like stencil streaming engine
+
+It has:
+
+```text
+supported op:
+  2D 5-point Jacobi interior update
+
+data layout:
+  contiguous row-major float32
+
+config latency:
+  medium
+
+throughput:
+  high cells/sec after startup
+
+memory:
+  limited line buffer / scratchpad
+
+transfer:
+  host-mediated DMA-like input/output movement
+
+concurrency:
+  1 pipeline per node
+
+strength:
+  predictable throughput and low energy
+
+weakness:
+  poor for tiny jobs and unsupported boundary logic
+```
+
+This is plausible on FPGA or ASIC.
+
+---
+
+# Example parameter table
+
+You can use something like this in the paper:
+
+| Parameter | Meaning                                 |
+| --------- | --------------------------------------- |
+| `L_cfg`   | accelerator configuration latency       |
+| `B_in`    | input bandwidth into accelerator        |
+| `B_out`   | output bandwidth from accelerator       |
+| `R_cell`  | stencil cells processed per microsecond |
+| `C`       | max concurrent pipelines                |
+| `M_local` | local scratchpad / tile capacity        |
+| `Q`       | current queue delay                     |
+
+Then:
+
+```text
+T_sim(tile) =
+    Q
+  + L_cfg
+  + input_bytes / B_in
+  + output_bytes / B_out
+  + cells / R_cell
+  + chunk_overhead(tile, M_local)
+```
+
+That is a very clean model.
+
+---
+
+# How this helps your 2-node story
+
+With SimPy included, you can compare:
+
+## Baseline 1
+
+CPU-only Jacobi with MPI halo.
+
+## Baseline 2
+
+GPU-only Jacobi with MPI halo.
+
+## Baseline 3
+
+Fixed SimPy interior update.
+
+## Your routed version
+
+Cost model chooses:
+
+* CPU/GPU/SIM for interior
+* CPU/GPU for border
+* MPI for halo
+
+This shows the value of the routing layer.
+
+Even if SimPy is artificial, your contribution is still real:
+
+> the framework can incorporate a domain-specific endpoint by giving it an executor and a cost model.
+
+That is exactly the point.
+
+---
+
+# What would be a good result?
+
+A very believable result is:
+
+* small grids: CPU wins because overhead dominates
+* medium grids: GPU or SIM wins depending on parameters
+* large grids: GPU/SIM wins for interior
+* high SimPy queue: router avoids SIM and uses GPU
+* high halo cost: two-node execution stops scaling
+
+You do **not** need SimPy to always beat GPU. In fact, it is more credible if it does not.
+
+The best result is:
+
+> routed execution tracks the best fixed endpoint across regimes and avoids bad endpoint choices.
+
+That is very defensible.
+
+---
+
+# Final recommendation
+
+In your Jacobi setup, make SimPy model a:
+
+> **stencil-specific streaming accelerator for regular interior tile updates**, with configurable setup latency, DMA bandwidth, pipeline throughput, scratchpad capacity, and queueing.
+
+Then your router treats it as a first-class endpoint alongside CPU and GPU.
+
+Use it only for:
+
+```text
+INTERIOR_STENCIL_UPDATE
+```
+
+and let CPU/GPU handle:
+
+```text
+BORDER_UPDATE
+HALO_PACK/UNPACK
+MPI coordination
+```
+
+That gives you the cleanest and most realistic story.
+
+
 ## Cost model assumption
 cost(endpoint, job) = transfer_cost + queue_delay + execution_cost
 
