@@ -13,7 +13,6 @@ namespace Routing
         int node_id = 0;
         int iteration = 0;
         int neighbor_node_id = -1;
-        double arrival_us = 0.0;
     };
 
     struct payloadSAXPY {

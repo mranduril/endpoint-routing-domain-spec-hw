@@ -37,6 +37,11 @@ struct DispatchPlan {
     std::size_t sim_begin = 0;
     std::size_t sim_end = 0;
     double estimated_cost = 0.0;
+    double cpu_estimated_cost = 0.0;
+    double gpu_estimated_cost = 0.0;
+    double split_estimated_cost = 0.0;
+    double sim_estimated_cost = 0.0;
+    std::size_t work_units = 0;
 };
 
 enum class RoutingPolicy {

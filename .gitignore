@@ -1,6 +1,7 @@
 .codex
 .vscode/
 build/
+outputs/
 *-context.md
 __pycache__/
 *.pyc

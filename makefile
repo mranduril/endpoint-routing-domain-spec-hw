@@ -27,6 +27,7 @@ LIB := $(LIB_DIR)/$(LIB_NAME)
 
 CPP_SRC_FILES := $(wildcard $(SRC_DIR)/*.cpp)
 CU_SRC_FILES := $(wildcard $(SRC_DIR)/*.cu)
+HEADER_FILES := $(wildcard $(INC_DIR)/*.h)
 CPP_OBJS := $(patsubst $(SRC_DIR)/%.cpp,$(OBJ_DIR)/%.o,$(CPP_SRC_FILES))
 CU_OBJS := $(patsubst $(SRC_DIR)/%.cu,$(OBJ_DIR)/%.o,$(CU_SRC_FILES))
 SRC_OBJS := $(CPP_OBJS) $(CU_OBJS)
@@ -45,10 +46,10 @@ examples: $(EXAMPLE_BINS)
 $(LIB): $(SRC_OBJS) | $(LIB_DIR)
 	$(AR) $(ARFLAGS) $@ $(SRC_OBJS)
 
-$(OBJ_DIR)/%.o: $(SRC_DIR)/%.cpp | $(OBJ_DIR)
+$(OBJ_DIR)/%.o: $(SRC_DIR)/%.cpp $(HEADER_FILES) | $(OBJ_DIR)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
 
-$(OBJ_DIR)/%.o: $(SRC_DIR)/%.cu | $(OBJ_DIR)
+$(OBJ_DIR)/%.o: $(SRC_DIR)/%.cu $(HEADER_FILES) | $(OBJ_DIR)
 	$(NVCC) $(CPPFLAGS) $(NVCCFLAGS) -c $< -o $@
 
 $(BIN_DIR)/%: $(EXAMPLE_DIR)/%.cpp $(LIB) | $(BIN_DIR)

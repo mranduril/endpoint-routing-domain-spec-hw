@@ -39,15 +39,6 @@ namespace Routing
         }
     }
 
-    void saxpy_simpy(float a, std::size_t n, const float* x, float* y)
-    {
-        (void)a;
-        (void)n;
-        (void)x;
-        (void)y;
-        throw std::logic_error("SimPy SAXPY endpoint is not implemented yet");
-    }
-
     void jacobi_interior_cpu(
         std::size_t nx,
         std::size_t ny,

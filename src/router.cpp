@@ -61,6 +61,22 @@ DispatchPlan make_sim_plan(std::size_t n, double estimated_cost)
     return plan;
 }
 
+DispatchPlan annotate_costs(
+    DispatchPlan plan,
+    double cpu_cost,
+    double gpu_cost,
+    double split_cost,
+    double sim_cost,
+    std::size_t work_units)
+{
+    plan.cpu_estimated_cost = cpu_cost;
+    plan.gpu_estimated_cost = gpu_cost;
+    plan.split_estimated_cost = split_cost;
+    plan.sim_estimated_cost = sim_cost;
+    plan.work_units = work_units;
+    return plan;
+}
+
 double estimate_split_cost(const payloadSAXPY& payload, const RouterConfig& config)
 {
     const std::size_t cpu_work = payload.n / 2;
@@ -134,16 +150,41 @@ DispatchPlan Router::plan_jacobi(
     const double cpu_cost = estimate_cpu(payload);
     const double gpu_cost = estimate_gpu(payload);
     const double sim_cost = estimate_sim(payload);
+    const double split_cost = std::max(cpu_cost, gpu_cost);
 
     switch (policy) {
         case RoutingPolicy::ForceCpu:
-            return make_cpu_plan(work_units, cpu_cost);
+            return annotate_costs(
+                make_cpu_plan(work_units, cpu_cost),
+                cpu_cost,
+                gpu_cost,
+                split_cost,
+                sim_cost,
+                work_units);
         case RoutingPolicy::ForceGpu:
-            return make_gpu_plan(work_units, gpu_cost);
+            return annotate_costs(
+                make_gpu_plan(work_units, gpu_cost),
+                cpu_cost,
+                gpu_cost,
+                split_cost,
+                sim_cost,
+                work_units);
         case RoutingPolicy::ForceSim:
-            return make_sim_plan(work_units, sim_cost);
+            return annotate_costs(
+                make_sim_plan(work_units, sim_cost),
+                cpu_cost,
+                gpu_cost,
+                split_cost,
+                sim_cost,
+                work_units);
         case RoutingPolicy::ForceSplit:
-            return make_split_plan(work_units, std::max(cpu_cost, gpu_cost));
+            return annotate_costs(
+                make_split_plan(work_units, split_cost),
+                cpu_cost,
+                gpu_cost,
+                split_cost,
+                sim_cost,
+                work_units);
         case RoutingPolicy::Auto:
         default: {
             DispatchPlan best_plan = make_cpu_plan(work_units, cpu_cost);
@@ -159,7 +200,13 @@ DispatchPlan Router::plan_jacobi(
                 best_plan = make_sim_plan(work_units, sim_cost);
             }
 
-            return best_plan;
+            return annotate_costs(
+                best_plan,
+                cpu_cost,
+                gpu_cost,
+                split_cost,
+                sim_cost,
+                work_units);
         }
     }
 }
@@ -173,13 +220,37 @@ DispatchPlan Router::plan_saxpy(const payloadSAXPY& payload, RoutingPolicy polic
 
     switch (policy) {
         case RoutingPolicy::ForceCpu:
-            return make_cpu_plan(payload.n, cpu_cost);
+            return annotate_costs(
+                make_cpu_plan(payload.n, cpu_cost),
+                cpu_cost,
+                gpu_cost,
+                split_cost,
+                sim_cost,
+                payload.n);
         case RoutingPolicy::ForceGpu:
-            return make_gpu_plan(payload.n, gpu_cost);
+            return annotate_costs(
+                make_gpu_plan(payload.n, gpu_cost),
+                cpu_cost,
+                gpu_cost,
+                split_cost,
+                sim_cost,
+                payload.n);
         case RoutingPolicy::ForceSplit:
-            return make_split_plan(payload.n, split_cost);
+            return annotate_costs(
+                make_split_plan(payload.n, split_cost),
+                cpu_cost,
+                gpu_cost,
+                split_cost,
+                sim_cost,
+                payload.n);
         case RoutingPolicy::ForceSim:
-            return make_sim_plan(payload.n, sim_cost);
+            return annotate_costs(
+                make_sim_plan(payload.n, sim_cost),
+                cpu_cost,
+                gpu_cost,
+                split_cost,
+                sim_cost,
+                payload.n);
         case RoutingPolicy::Auto:
         default: {
             DispatchPlan best_plan = make_cpu_plan(payload.n, cpu_cost);
@@ -196,7 +267,13 @@ DispatchPlan Router::plan_saxpy(const payloadSAXPY& payload, RoutingPolicy polic
                 best_plan = make_sim_plan(payload.n, sim_cost);
             }
 
-            return best_plan;
+            return annotate_costs(
+                best_plan,
+                cpu_cost,
+                gpu_cost,
+                split_cost,
+                sim_cost,
+                payload.n);
         }
     }
 }

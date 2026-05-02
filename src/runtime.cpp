@@ -2,8 +2,8 @@
 
 #include "kernels.h"
 
-#include <exception>
 #include <cstdlib>
+#include <exception>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
@@ -16,7 +16,7 @@ namespace Routing
 {
 namespace
 {
-std::string workload_name(WorkloadType type)
+const char* workload_name(WorkloadType type)
 {
     switch (type) {
         case WorkloadType::SAXPY:
@@ -32,54 +32,127 @@ std::string workload_name(WorkloadType type)
     }
 }
 
-const char* sim_trace_path()
+const char* dispatch_name(DispatchKind kind)
 {
-    const char* configured = std::getenv("ROUTING_SIM_TRACE");
-    return configured != nullptr ? configured : "traces/sim_jobs.jsonl";
-}
-
-void ensure_default_trace_dir()
-{
-    const char* configured = std::getenv("ROUTING_SIM_TRACE");
-    if (configured == nullptr) {
-        mkdir("traces", 0775);
+    switch (kind) {
+        case DispatchKind::CpuOnly:
+            return "CpuOnly";
+        case DispatchKind::GpuOnly:
+            return "GpuOnly";
+        case DispatchKind::CpuGpuSplit:
+            return "CpuGpuSplit";
+        case DispatchKind::SimOnly:
+            return "SimOnly";
+        default:
+            return "Unknown";
     }
 }
 
-void emit_sim_trace_record(const Job& job)
+const char* node_name(NodeKind kind)
 {
-    ensure_default_trace_dir();
-    std::ofstream trace(sim_trace_path(), std::ios::app);
-    if (!trace) {
-        throw std::runtime_error("Failed to open SIM trace output");
+    switch (kind) {
+        case NodeKind::Local:
+            return "Local";
+        case NodeKind::Remote:
+            return "Remote";
+        default:
+            return "Unknown";
+    }
+}
+
+const char* run_log_path()
+{
+    const char* configured = std::getenv("ROUTING_RUN_LOG");
+    return configured != nullptr ? configured : "outputs/routing_run_log.jsonl";
+}
+
+void ensure_output_dir()
+{
+    mkdir("outputs", 0775);
+}
+
+void write_plan_ranges_json(std::ostream& out, const DispatchPlan& plan)
+{
+    out << "\"ranges\":{"
+        << "\"cpu\":[" << plan.cpu_begin << "," << plan.cpu_end << "]"
+        << ",\"gpu\":[" << plan.gpu_begin << "," << plan.gpu_end << "]"
+        << ",\"sim\":[" << plan.sim_begin << "," << plan.sim_end << "]"
+        << "}";
+}
+
+void write_cost_model_json(std::ostream& out, const DispatchPlan& plan)
+{
+    out << "\"cost_model\":{"
+        << "\"cpu\":" << plan.cpu_estimated_cost
+        << ",\"gpu\":" << plan.gpu_estimated_cost
+        << ",\"split\":" << plan.split_estimated_cost
+        << ",\"sim\":" << plan.sim_estimated_cost
+        << "}";
+}
+
+void write_dispatch_plan_json_fields(std::ostream& out, const DispatchPlan& plan)
+{
+    out << "\"node_kind\":\"" << node_name(plan.node_kind) << "\""
+        << ",\"decision\":\"" << dispatch_name(plan.kind) << "\""
+        << ",\"estimated_cost\":" << plan.estimated_cost
+        << ",\"work_units\":" << plan.work_units
+        << ",";
+    write_cost_model_json(out, plan);
+    out << ",";
+    write_plan_ranges_json(out, plan);
+}
+
+void print_work_range(
+    std::ostream& out,
+    const char* label,
+    std::size_t begin,
+    std::size_t end)
+{
+    if (end > begin) {
+        out << "  " << label << " Work Range: ["
+            << begin << ", " << end << ")\n";
+    }
+}
+
+void print_dispatch_plan(std::ostream& out, const DispatchPlan& plan)
+{
+    out << "Dispatch Plan:\n"
+        << "  Node Kind: " << node_name(plan.node_kind) << '\n'
+        << "  Dispatch Kind: " << dispatch_name(plan.kind) << '\n';
+
+    print_work_range(out, "CPU", plan.cpu_begin, plan.cpu_end);
+    print_work_range(out, "GPU", plan.gpu_begin, plan.gpu_end);
+    print_work_range(out, "SIM", plan.sim_begin, plan.sim_end);
+
+    out << "  Estimated Cost: " << plan.estimated_cost << '\n'
+        << "  Work Units: " << plan.work_units << '\n'
+        << "  Cost Model: "
+        << "cpu=" << plan.cpu_estimated_cost
+        << ", gpu=" << plan.gpu_estimated_cost
+        << ", split=" << plan.split_estimated_cost
+        << ", sim=" << plan.sim_estimated_cost << '\n';
+}
+
+void write_routing_log(
+    const Job& job,
+    RoutingPolicy policy,
+    const DispatchPlan& plan)
+{
+    ensure_output_dir();
+    std::ofstream log(run_log_path(), std::ios::app);
+    if (!log) {
+        throw std::runtime_error("Failed to open routing run log");
     }
 
-    trace << "{\"job_id\":" << job.metadata.job_id
-          << ",\"node_id\":" << job.metadata.node_id
-          << ",\"endpoint\":\"SIM" << job.metadata.node_id << "\""
-          << ",\"op\":\"" << workload_name(job.type) << "\""
-          << ",\"arrival_us\":" << job.metadata.arrival_us;
-
-    if (std::holds_alternative<payloadSAXPY>(job.payload)) {
-        const auto& saxpy = std::get<payloadSAXPY>(job.payload);
-        trace << ",\"n\":" << saxpy.n
-              << ",\"input_bytes\":" << saxpy.n * sizeof(float) * 2
-              << ",\"output_bytes\":" << saxpy.n * sizeof(float)
-              << ",\"metadata\":{\"dtype\":\"float32\",\"layout\":\"contiguous\"}";
-    } else if (std::holds_alternative<payloadJacobi>(job.payload)) {
-        const auto& jacobi = std::get<payloadJacobi>(job.payload);
-        const std::size_t grid_bytes = jacobi.nx * jacobi.ny * sizeof(float);
-        trace << ",\"nx\":" << jacobi.nx
-              << ",\"ny\":" << jacobi.ny
-              << ",\"halo_width\":" << jacobi.halo_width
-              << ",\"input_bytes\":" << grid_bytes
-              << ",\"output_bytes\":" << grid_bytes
-              << ",\"metadata\":{\"stencil\":\"2d_5pt\",\"dtype\":\"float32\","
-              << "\"layout\":\"row_major\",\"iteration\":" << job.metadata.iteration
-              << ",\"neighbor_node_id\":" << job.metadata.neighbor_node_id << "}";
-    }
-
-    trace << "}\n";
+    log << "{\"job_id\":" << job.metadata.job_id
+        << ",\"node_id\":" << job.metadata.node_id
+        << ",\"iteration\":" << job.metadata.iteration
+        << ",\"neighbor_node_id\":" << job.metadata.neighbor_node_id
+        << ",\"op\":\"" << workload_name(job.type) << "\""
+        << ",\"policy\":\"" << RoutingPolicyNames.at(policy) << "\""
+        << ",";
+    write_dispatch_plan_json_fields(log, plan);
+    log << "}\n";
 }
 
 void run_jacobi_cpu(WorkloadType type, const payloadJacobi& jacobi)
@@ -100,6 +173,42 @@ void run_jacobi_cpu(WorkloadType type, const payloadJacobi& jacobi)
         jacobi.halo_width,
         jacobi.input->data(),
         jacobi.output->data());
+}
+
+void run_jacobi_simpy(
+    WorkloadType type,
+    const payloadJacobi& jacobi,
+    const JobMetadata& metadata)
+{
+    if (type == WorkloadType::JACOBI_INTERIOR) {
+        jacobi_interior_simpy(
+            jacobi.nx,
+            jacobi.ny,
+            jacobi.halo_width,
+            jacobi.input->data(),
+            jacobi.output->data(),
+            metadata);
+        return;
+    }
+
+    if (type == WorkloadType::JACOBI_BOUNDARY) {
+        jacobi_boundary_simpy(
+            jacobi.nx,
+            jacobi.ny,
+            jacobi.halo_width,
+            jacobi.input->data(),
+            jacobi.output->data(),
+            metadata);
+        return;
+    }
+
+    jacobi_halo_boundary_simpy(
+        jacobi.nx,
+        jacobi.ny,
+        jacobi.halo_width,
+        jacobi.input->data(),
+        jacobi.output->data(),
+        metadata);
 }
 }
 
@@ -142,6 +251,7 @@ Request submit(Job job, RoutingPolicy policy)
 
     Router router;
     state->plan = router.plan(state->job, policy);
+    write_routing_log(state->job, policy, state->plan);
     state->status = RequestStatus::Running;
 
     std::thread([state]() {
@@ -222,7 +332,12 @@ Request submit(Job job, RoutingPolicy policy)
                             break;
                         }
                         case DispatchKind::SimOnly:
-                            emit_sim_trace_record(state->job);
+                            saxpy_simpy(
+                                saxpy.a,
+                                saxpy.n,
+                                saxpy.x->data(),
+                                saxpy.y->data(),
+                                state->job.metadata);
                             break;
                         default:
                             throw std::logic_error("Selected dispatch plan is not implemented yet");
@@ -253,7 +368,10 @@ Request submit(Job job, RoutingPolicy policy)
                                 jacobi.output->data());
                             break;
                         case DispatchKind::SimOnly:
-                            emit_sim_trace_record(state->job);
+                            run_jacobi_simpy(
+                                state->job.type,
+                                jacobi,
+                                state->job.metadata);
                             break;
                         default:
                             throw std::logic_error("Selected Jacobi dispatch plan is not implemented yet");
@@ -287,35 +405,7 @@ void Request::inspect_dispatch_plan() {
         throw std::invalid_argument("Cannot inspect an invalid request");
     }
 
-    std::cout << "Dispatch Plan:" << std::endl;
-    std::cout << "  Node Kind: " << (state_->plan.node_kind == NodeKind::Local ? "Local" : "Remote") << std::endl;
-    std::cout << "  Dispatch Kind: ";
-    switch (state_->plan.kind) {
-        case DispatchKind::CpuOnly:
-            std::cout << "CPU Only";
-            break;
-        case DispatchKind::GpuOnly:
-            std::cout << "GPU Only";
-            break;
-        case DispatchKind::CpuGpuSplit:
-            std::cout << "CPU-GPU Split";
-            break;
-        case DispatchKind::SimOnly:
-            std::cout << "SIM Only";
-            break;
-    }
-    std::cout << std::endl;
-
-    if (state_->plan.cpu_end > state_->plan.cpu_begin) {
-        std::cout << "  CPU Work Range: [" << state_->plan.cpu_begin << ", " << state_->plan.cpu_end << ")" << std::endl;
-    }
-    if (state_->plan.gpu_end > state_->plan.gpu_begin) {
-        std::cout << "  GPU Work Range: [" << state_->plan.gpu_begin << ", " << state_->plan.gpu_end << ")" << std::endl;
-    }
-    if (state_->plan.sim_end > state_->plan.sim_begin) {
-        std::cout << "  SIM Work Range: [" << state_->plan.sim_begin << ", " << state_->plan.sim_end << ")" << std::endl;
-    }
-    std::cout << "  Estimated Cost: " << state_->plan.estimated_cost << std::endl;
+    print_dispatch_plan(std::cout, state_->plan);
 }
 
 } // namespace Routing
