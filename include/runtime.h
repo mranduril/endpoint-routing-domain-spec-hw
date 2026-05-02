@@ -1,4 +1,5 @@
-// Signatures of runtime APIs.
+// Runtime API. submit() routes a logical Job and launches endpoint execution in
+// a detached worker thread; Request is the handle used to wait/query completion.
 #ifndef RUNTIME_H
 #define RUNTIME_H
 
@@ -21,8 +22,6 @@ namespace Routing
 
     class Request
     {
-        // This is a placeholder for the return type of submit. It can be used to query the status of the job, or to retrieve results when the job is done.
-        // By design, it is an async handle
         public:
             Request() = default;
 
@@ -38,6 +37,8 @@ namespace Routing
 
         private:
             struct State {
+                // State is shared with the detached worker thread. Request is
+                // copyable via shared_ptr ownership and wait() observes status.
                 Job job;
                 DispatchPlan plan{};
                 RequestStatus status = RequestStatus::Pending;

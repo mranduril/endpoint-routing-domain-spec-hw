@@ -8,11 +8,25 @@
 
 namespace Routing
 {
+    // Logical data residency used by the router to decide whether an endpoint
+    // should pay movement costs before or after execution.
+    enum class DataLocation {
+        Host,
+        GPU,
+        SIM,
+        Remote,
+        Unknown
+    };
+
     struct JobMetadata {
         std::size_t job_id = 0;
         int node_id = 0;
         int iteration = 0;
         int neighbor_node_id = -1;
+        // Defaults match the current examples: user buffers live on host memory
+        // and results are expected back on host memory.
+        DataLocation input_location = DataLocation::Host;
+        DataLocation output_location = DataLocation::Host;
     };
 
     struct payloadSAXPY {

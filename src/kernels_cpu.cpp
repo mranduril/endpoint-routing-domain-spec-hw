@@ -22,6 +22,8 @@ namespace Routing
             std::size_t ny,
             std::size_t halo_width)
         {
+            // Boundary work means the band near the local tile edges. These
+            // cells are the ones that matter for halo-aware scheduling.
             return row < 2 * halo_width ||
                 col < 2 * halo_width ||
                 row >= ny - 2 * halo_width ||
@@ -59,6 +61,8 @@ namespace Routing
 #endif
         for (std::size_t row = halo_width; row < ny - halo_width; ++row) {
             for (std::size_t col = halo_width; col < nx - halo_width; ++col) {
+                // Interior and boundary kernels are complementary; together
+                // they update the full non-halo Jacobi domain exactly once.
                 if (!is_boundary_work(row, col, nx, ny, halo_width)) {
                     output[row * nx + col] = jacobi_cell(input, nx, row, col);
                 }

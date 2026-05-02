@@ -47,6 +47,8 @@ namespace Routing
 
     bool Job::validate() const
     {
+        // Validation is intentionally conservative: invalid jobs fail before
+        // routing, where errors would otherwise look like endpoint failures.
         switch (type) {
             case WorkloadType::SAXPY: {
                 if (!std::holds_alternative<payloadSAXPY>(payload)) {
@@ -71,6 +73,9 @@ namespace Routing
             case WorkloadType::JACOBI_INTERIOR:
             case WorkloadType::JACOBI_BOUNDARY:
             case WorkloadType::JACOBI_HALO_BOUNDARY: {
+                // Jacobi uses flat row-major buffers of size nx * ny. The halo
+                // width describes which cells belong to interior vs boundary
+                // work, not extra storage outside the grid.
                 if (!std::holds_alternative<payloadJacobi>(payload)) {
                     return false;
                 }

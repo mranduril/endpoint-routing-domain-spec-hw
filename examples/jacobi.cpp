@@ -70,6 +70,8 @@ int main()
     mkdir("outputs", 0775);
     mkdir("outputs/sim_traces", 0775);
     const std::string timestamp = run_timestamp();
+    // Keep traces stable for downstream SimPy commands, but timestamp routing
+    // logs so each example run preserves its cost-model decisions.
     const char* trace_path = "outputs/sim_traces/routing_jacobi_sim_jobs.jsonl";
     const std::string log_path = "outputs/routing_jacobi_run_log_" +
         timestamp + ".jsonl";

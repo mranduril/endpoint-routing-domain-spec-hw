@@ -1,4 +1,5 @@
-// This should be wrappers that call the endpoints
+// Endpoint wrappers. CPU/GPU functions perform real math. SIM functions emit a
+// SimPy trace for performance modeling and then call CPU fallback for results.
 #ifndef KERNELS_H
 #define KERNELS_H
 
@@ -10,6 +11,8 @@ namespace Routing
 {
     void saxpy_cpu_only(float a, std::size_t n, const float* x, float* y);
     void saxpy_gpu_only(float a, std::size_t n, const float* x, float* y);
+    // SIM operators accept metadata because trace records need job/node IDs and
+    // iteration information; CPU/GPU kernels intentionally stay math-only.
     void saxpy_simpy(
         float a,
         std::size_t n,

@@ -1,4 +1,5 @@
-// Header definition of a Job for the user to implement
+// Public logical job API. Users construct Jobs here; the router maps them to
+// physical endpoint implementations in CPU/GPU/SIM kernels.
 #ifndef JOB_H
 #define JOB_H
 
@@ -10,7 +11,9 @@ namespace Routing
 {
     struct Job
     {
-        WorkloadType type;  // Carries the type of workload
+        WorkloadType type;
+        // Metadata is deliberately separate from the payload so scheduling
+        // hints can evolve without changing the math payload layout.
         JobMetadata metadata;
         std::variant<payloadSAXPY, payloadJacobi> payload;
 

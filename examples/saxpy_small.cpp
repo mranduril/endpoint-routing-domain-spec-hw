@@ -39,6 +39,8 @@ int main()
     mkdir("outputs", 0775);
     mkdir("outputs/sim_traces", 0775);
     const std::string timestamp = run_timestamp();
+    // Examples own their output paths. The runtime only honors the environment
+    // variables and appends routing/SIM records there.
     const char* trace_path = "outputs/sim_traces/routing_saxpy_sim_jobs.jsonl";
     const std::string log_path = "outputs/routing_saxpy_run_log_" +
         timestamp + ".jsonl";

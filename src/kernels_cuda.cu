@@ -41,6 +41,9 @@ __global__ void jacobi_interior_kernel(
 
     const std::size_t row = idx / nx;
     const std::size_t col = idx % nx;
+    // GPU support currently covers interior work only. Boundary/halo work is
+    // intentionally left to CPU or SIM because that is where communication
+    // sensitivity is easiest to model.
     if (row < 2 * halo_width || col < 2 * halo_width ||
         row >= ny - 2 * halo_width || col >= nx - 2 * halo_width) {
         return;
@@ -112,6 +115,9 @@ void jacobi_interior_gpu(
     const float* input,
     float* output)
 {
+    // This simple wrapper copies full input/output grids each launch. The cost
+    // model can skip these copies when metadata says data is already on GPU,
+    // but this implementation still assumes host vectors for correctness.
     if (input == nullptr || output == nullptr) {
         throw std::invalid_argument("jacobi_interior_gpu received a null buffer");
     }

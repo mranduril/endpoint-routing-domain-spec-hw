@@ -2,6 +2,7 @@
 
 #include "kernels.h"
 
+#include <atomic>
 #include <cstdlib>
 #include <exception>
 #include <fstream>
@@ -16,6 +17,10 @@ namespace Routing
 {
 namespace
 {
+std::atomic<std::size_t> g_cpu_jobs{0};
+std::atomic<std::size_t> g_gpu_jobs{0};
+std::atomic<std::size_t> g_sim_jobs{0};
+
 const char* workload_name(WorkloadType type)
 {
     switch (type) {
@@ -60,6 +65,24 @@ const char* node_name(NodeKind kind)
     }
 }
 
+const char* data_location_name(DataLocation location)
+{
+    switch (location) {
+        case DataLocation::Host:
+            return "Host";
+        case DataLocation::GPU:
+            return "GPU";
+        case DataLocation::SIM:
+            return "SIM";
+        case DataLocation::Remote:
+            return "Remote";
+        case DataLocation::Unknown:
+            return "Unknown";
+        default:
+            return "Unknown";
+    }
+}
+
 const char* run_log_path()
 {
     const char* configured = std::getenv("ROUTING_RUN_LOG");
@@ -87,19 +110,75 @@ void write_cost_model_json(std::ostream& out, const DispatchPlan& plan)
         << ",\"gpu\":" << plan.gpu_estimated_cost
         << ",\"split\":" << plan.split_estimated_cost
         << ",\"sim\":" << plan.sim_estimated_cost
+        << ",\"remote\":" << plan.remote_estimated_cost
         << "}";
 }
 
 void write_dispatch_plan_json_fields(std::ostream& out, const DispatchPlan& plan)
 {
     out << "\"node_kind\":\"" << node_name(plan.node_kind) << "\""
+        << ",\"target_node_id\":" << plan.target_node_id
         << ",\"decision\":\"" << dispatch_name(plan.kind) << "\""
         << ",\"estimated_cost\":" << plan.estimated_cost
         << ",\"work_units\":" << plan.work_units
+        << ",\"input_bytes\":" << plan.input_bytes
+        << ",\"output_bytes\":" << plan.output_bytes
         << ",";
     write_cost_model_json(out, plan);
     out << ",";
     write_plan_ranges_json(out, plan);
+}
+
+RouterConfig runtime_router_config()
+{
+    // Snapshot queue pressure at planning time. This avoids global scheduler
+    // state inside Router and keeps the router deterministic for a config.
+    RouterConfig config;
+    config.queued_cpu_jobs = g_cpu_jobs.load();
+    config.queued_gpu_jobs = g_gpu_jobs.load();
+    config.queued_sim_jobs = g_sim_jobs.load();
+    return config;
+}
+
+void increment_pressure(const DispatchPlan& plan)
+{
+    // These counters are an intentionally lightweight approximation of queue
+    // pressure. The next planning decision sees currently running work and can
+    // bias away from a busy endpoint.
+    switch (plan.kind) {
+        case DispatchKind::CpuOnly:
+            ++g_cpu_jobs;
+            break;
+        case DispatchKind::GpuOnly:
+            ++g_gpu_jobs;
+            break;
+        case DispatchKind::CpuGpuSplit:
+            ++g_cpu_jobs;
+            ++g_gpu_jobs;
+            break;
+        case DispatchKind::SimOnly:
+            ++g_sim_jobs;
+            break;
+    }
+}
+
+void decrement_pressure(const DispatchPlan& plan)
+{
+    switch (plan.kind) {
+        case DispatchKind::CpuOnly:
+            --g_cpu_jobs;
+            break;
+        case DispatchKind::GpuOnly:
+            --g_gpu_jobs;
+            break;
+        case DispatchKind::CpuGpuSplit:
+            --g_cpu_jobs;
+            --g_gpu_jobs;
+            break;
+        case DispatchKind::SimOnly:
+            --g_sim_jobs;
+            break;
+    }
 }
 
 void print_work_range(
@@ -125,12 +204,16 @@ void print_dispatch_plan(std::ostream& out, const DispatchPlan& plan)
     print_work_range(out, "SIM", plan.sim_begin, plan.sim_end);
 
     out << "  Estimated Cost: " << plan.estimated_cost << '\n'
+        << "  Target Node ID: " << plan.target_node_id << '\n'
         << "  Work Units: " << plan.work_units << '\n'
+        << "  Input Bytes: " << plan.input_bytes << '\n'
+        << "  Output Bytes: " << plan.output_bytes << '\n'
         << "  Cost Model: "
         << "cpu=" << plan.cpu_estimated_cost
         << ", gpu=" << plan.gpu_estimated_cost
         << ", split=" << plan.split_estimated_cost
-        << ", sim=" << plan.sim_estimated_cost << '\n';
+        << ", sim=" << plan.sim_estimated_cost
+        << ", remote=" << plan.remote_estimated_cost << '\n';
 }
 
 void write_routing_log(
@@ -148,6 +231,11 @@ void write_routing_log(
         << ",\"node_id\":" << job.metadata.node_id
         << ",\"iteration\":" << job.metadata.iteration
         << ",\"neighbor_node_id\":" << job.metadata.neighbor_node_id
+        << ",\"data_location\":{\"input\":\""
+        << data_location_name(job.metadata.input_location)
+        << "\",\"output\":\""
+        << data_location_name(job.metadata.output_location)
+        << "\"}"
         << ",\"op\":\"" << workload_name(job.type) << "\""
         << ",\"policy\":\"" << RoutingPolicyNames.at(policy) << "\""
         << ",";
@@ -249,9 +337,12 @@ Request submit(Job job, RoutingPolicy policy)
     auto state = std::make_shared<Request::State>();
     state->job = std::move(job);
 
-    Router router;
+    // Planning happens synchronously so callers can inspect/log the selected
+    // dispatch immediately, while actual endpoint work runs asynchronously.
+    Router router(runtime_router_config());
     state->plan = router.plan(state->job, policy);
     write_routing_log(state->job, policy, state->plan);
+    increment_pressure(state->plan);
     state->status = RequestStatus::Running;
 
     std::thread([state]() {
@@ -394,6 +485,8 @@ Request submit(Job job, RoutingPolicy policy)
             }
         }
 
+        // Keep queue-pressure counters balanced for both success and failure.
+        decrement_pressure(state->plan);
         state->cv.notify_all();
     }).detach();
 
