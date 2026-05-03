@@ -27,6 +27,12 @@ enum class EndpointKind {
     SIM
 };
 
+struct EndpointAvailability {
+    bool cpu = true;
+    bool gpu = true;
+    bool sim = true;
+};
+
 struct DispatchPlan {
     // The plan is both an execution recipe and a logging artifact. The ranges
     // describe the logical work slice assigned to each endpoint.
@@ -66,8 +72,14 @@ inline std::unordered_map<RoutingPolicy, std::string> RoutingPolicyNames = {
     {RoutingPolicy::ForceSim, "ForceSim"}
 };
 
+enum class CostModelPreset {
+    Default,
+    SimPyAlignedStencil
+};
+
 struct RouterConfig {
     int local_node_id = 0;
+    std::unordered_map<int, EndpointAvailability> endpoint_availability;
 
     // Base queue terms can be supplied externally. The runtime also fills the
     // queued_*_jobs fields from currently in-flight endpoint work before
@@ -101,6 +113,14 @@ struct RouterConfig {
     double remote_fixed = 10000.0;
     double remote_transfer_per_byte = 1.0;
 };
+
+RouterConfig make_router_config(
+    int local_node_id = 0,
+    CostModelPreset preset = CostModelPreset::Default);
+
+void apply_cost_model_preset(
+    RouterConfig& config,
+    CostModelPreset preset);
 
 class Router {
 public:

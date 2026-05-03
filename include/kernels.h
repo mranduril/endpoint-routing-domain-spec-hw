@@ -32,6 +32,12 @@ namespace Routing
         std::size_t halo_width,
         const float* input,
         float* output);
+    void jacobi_exchange_halos_cpu(
+        std::size_t nx,
+        std::size_t owned_rows,
+        float* tile,
+        int node_id,
+        int neighbor_node_id);
     void jacobi_interior_gpu(
         std::size_t nx,
         std::size_t ny,

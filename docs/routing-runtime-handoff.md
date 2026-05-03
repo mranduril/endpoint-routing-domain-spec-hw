@@ -262,4 +262,3 @@ python -m prototype.run_simpy \
   not implemented.
 - The cost constants are placeholders and should be calibrated from benchmark
   results and SimPy summaries.
-

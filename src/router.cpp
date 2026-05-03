@@ -1,7 +1,9 @@
 #include "router.h"
 
 #include <algorithm>
+#include <limits>
 #include <stdexcept>
+#include <string>
 #include <variant>
 
 namespace Routing
@@ -18,6 +20,82 @@ void annotate_node(DispatchPlan& plan, const JobMetadata& metadata, const Router
     // an MPI executor before remote plans can execute on another process.
     plan.target_node_id = metadata.node_id;
     plan.node_kind = node_kind_for(metadata, config);
+}
+
+const EndpointAvailability& availability_for_node(
+    const RouterConfig& config,
+    int node_id)
+{
+    static const EndpointAvailability default_availability{};
+    const auto it = config.endpoint_availability.find(node_id);
+    return it == config.endpoint_availability.end() ?
+        default_availability : it->second;
+}
+
+bool endpoint_available(
+    const RouterConfig& config,
+    int node_id,
+    EndpointKind endpoint)
+{
+    const EndpointAvailability& availability =
+        availability_for_node(config, node_id);
+    switch (endpoint) {
+        case EndpointKind::CPU:
+            return availability.cpu;
+        case EndpointKind::GPU:
+            return availability.gpu;
+        case EndpointKind::SIM:
+            return availability.sim;
+        default:
+            return false;
+    }
+}
+
+double unavailable_cost()
+{
+    return std::numeric_limits<double>::max() / 4.0;
+}
+
+void require_endpoint(
+    const RouterConfig& config,
+    const JobMetadata& metadata,
+    EndpointKind endpoint,
+    const char* endpoint_name)
+{
+    if (!endpoint_available(config, metadata.node_id, endpoint)) {
+        throw std::invalid_argument(
+            std::string(endpoint_name) +
+            " endpoint is not available for target node " +
+            std::to_string(metadata.node_id));
+    }
+}
+
+void apply_simpy_aligned_stencil_preset(RouterConfig& config)
+{
+    // These global heuristic terms use microsecond-ish units and are aligned
+    // with prototype/sim_endpoint.py defaults. Workload-specific code only
+    // supplies normalized work units and byte counts; the endpoint estimators
+    // below decide which terms apply.
+    constexpr double pcie_bytes_per_us = 12000.0;
+
+    config.cpu_per_work_unit = 0.02;
+    config.move_to_host_per_byte = 1.0 / pcie_bytes_per_us;
+
+    config.cuda_launch = 6.0;
+    config.gpu_per_work_unit = 0.00008;
+    config.copy_to_gpu_per_byte = 1.0 / pcie_bytes_per_us;
+    config.copy_back_per_byte = 1.0 / pcie_bytes_per_us;
+
+    config.sim_setup = 8.0;
+    config.sim_per_work_unit = 1.0 / 4000.0;
+    config.sim_transfer_in_per_byte = 1.0 / pcie_bytes_per_us;
+    config.sim_transfer_out_per_byte = 1.0 / pcie_bytes_per_us;
+
+    config.cpu_queue_job_penalty = 3.0;
+    config.gpu_queue_job_penalty = 6.0;
+    config.sim_queue_job_penalty = 8.0;
+    config.remote_fixed = 25.0;
+    config.remote_transfer_per_byte = 1.0 / pcie_bytes_per_us;
 }
 
 DispatchPlan make_cpu_plan(
@@ -297,6 +375,31 @@ Router::JobCostMetrics jacobi_metrics(const payloadJacobi& payload, WorkloadType
     return metrics;
 }
 
+RouterConfig make_router_config(
+    int local_node_id,
+    CostModelPreset preset)
+{
+    RouterConfig config;
+    config.local_node_id = local_node_id;
+    apply_cost_model_preset(config, preset);
+    return config;
+}
+
+void apply_cost_model_preset(
+    RouterConfig& config,
+    CostModelPreset preset)
+{
+    switch (preset) {
+        case CostModelPreset::Default:
+            return;
+        case CostModelPreset::SimPyAlignedStencil:
+            apply_simpy_aligned_stencil_preset(config);
+            return;
+        default:
+            throw std::invalid_argument("Unknown cost model preset");
+    }
+}
+
 Router::Router(RouterConfig config)
     : config_(config)
 {
@@ -343,13 +446,26 @@ DispatchPlan Router::plan_jacobi(
     JobCostMetrics located_metrics = metrics;
     apply_locations(located_metrics, metadata);
     const double remote_cost = estimate_remote(located_metrics, metadata);
-    const double cpu_cost = estimate_cpu(located_metrics) + remote_cost;
-    const double gpu_cost = estimate_gpu(located_metrics) + remote_cost;
-    const double sim_cost = estimate_sim(located_metrics) + remote_cost;
-    const double split_cost = estimate_split_cost(located_metrics, config_) + remote_cost;
+    const bool cpu_available =
+        endpoint_available(config_, metadata.node_id, EndpointKind::CPU);
+    const bool gpu_available =
+        endpoint_available(config_, metadata.node_id, EndpointKind::GPU);
+    const bool sim_available =
+        endpoint_available(config_, metadata.node_id, EndpointKind::SIM);
+    const bool gpu_supported = type == WorkloadType::JACOBI_INTERIOR;
+    const double cpu_cost = cpu_available ?
+        estimate_cpu(located_metrics) + remote_cost : unavailable_cost();
+    const double gpu_cost = (gpu_available && gpu_supported) ?
+        estimate_gpu(located_metrics) + remote_cost : unavailable_cost();
+    const double sim_cost = sim_available ?
+        estimate_sim(located_metrics) + remote_cost : unavailable_cost();
+    // Jacobi is decomposed into routed operators; intra-operator split execution
+    // is intentionally left out until the runtime has CPU+SIM/GPU+SIM slices.
+    const double split_cost = unavailable_cost();
 
     switch (policy) {
         case RoutingPolicy::ForceCpu:
+            require_endpoint(config_, metadata, EndpointKind::CPU, "CPU");
             return annotate_costs(
                 make_cpu_plan(metrics.work_units, cpu_cost, metadata, config_),
                 cpu_cost,
@@ -359,6 +475,11 @@ DispatchPlan Router::plan_jacobi(
                 remote_cost,
                 located_metrics);
         case RoutingPolicy::ForceGpu:
+            require_endpoint(config_, metadata, EndpointKind::GPU, "GPU");
+            if (!gpu_supported) {
+                throw std::invalid_argument(
+                    "GPU Jacobi support is currently limited to interior jobs");
+            }
             return annotate_costs(
                 make_gpu_plan(metrics.work_units, gpu_cost, metadata, config_),
                 cpu_cost,
@@ -368,6 +489,7 @@ DispatchPlan Router::plan_jacobi(
                 remote_cost,
                 located_metrics);
         case RoutingPolicy::ForceSim:
+            require_endpoint(config_, metadata, EndpointKind::SIM, "SIM");
             return annotate_costs(
                 make_sim_plan(metrics.work_units, sim_cost, metadata, config_),
                 cpu_cost,
@@ -377,14 +499,8 @@ DispatchPlan Router::plan_jacobi(
                 remote_cost,
                 located_metrics);
         case RoutingPolicy::ForceSplit:
-            return annotate_costs(
-                make_split_plan(metrics.work_units, split_cost, metadata, config_),
-                cpu_cost,
-                gpu_cost,
-                split_cost,
-                sim_cost,
-                remote_cost,
-                located_metrics);
+            throw std::invalid_argument(
+                "Jacobi split dispatch is not implemented; route decomposed operators instead");
         case RoutingPolicy::Auto:
         default: {
             DispatchPlan best_plan = make_cpu_plan(
@@ -393,15 +509,17 @@ DispatchPlan Router::plan_jacobi(
                 metadata,
                 config_);
 
-            // Boundary work is the useful SIM endpoint story; interior work can use GPU.
-            if (type == WorkloadType::JACOBI_INTERIOR &&
-                gpu_cost < best_plan.estimated_cost) {
+            if (gpu_cost < best_plan.estimated_cost) {
                 best_plan = make_gpu_plan(metrics.work_units, gpu_cost, metadata, config_);
             }
 
-            if (type != WorkloadType::JACOBI_INTERIOR &&
-                sim_cost < best_plan.estimated_cost) {
+            if (sim_cost < best_plan.estimated_cost) {
                 best_plan = make_sim_plan(metrics.work_units, sim_cost, metadata, config_);
+            }
+
+            if (best_plan.estimated_cost == unavailable_cost()) {
+                throw std::invalid_argument(
+                    "No available endpoint can execute the Jacobi job");
             }
 
             return annotate_costs(
@@ -425,13 +543,25 @@ DispatchPlan Router::plan_saxpy(
     JobCostMetrics located_metrics = metrics;
     apply_locations(located_metrics, metadata);
     const double remote_cost = estimate_remote(located_metrics, metadata);
-    const double cpu_cost = estimate_cpu(located_metrics) + remote_cost;
-    const double gpu_cost = estimate_gpu(located_metrics) + remote_cost;
-    const double sim_cost = estimate_sim(located_metrics) + remote_cost;
-    const double split_cost = estimate_split_cost(located_metrics, config_) + remote_cost;
+    const bool cpu_available =
+        endpoint_available(config_, metadata.node_id, EndpointKind::CPU);
+    const bool gpu_available =
+        endpoint_available(config_, metadata.node_id, EndpointKind::GPU);
+    const bool sim_available =
+        endpoint_available(config_, metadata.node_id, EndpointKind::SIM);
+    const double cpu_cost = cpu_available ?
+        estimate_cpu(located_metrics) + remote_cost : unavailable_cost();
+    const double gpu_cost = gpu_available ?
+        estimate_gpu(located_metrics) + remote_cost : unavailable_cost();
+    const double sim_cost = sim_available ?
+        estimate_sim(located_metrics) + remote_cost : unavailable_cost();
+    const double split_cost = (cpu_available && gpu_available) ?
+        estimate_split_cost(located_metrics, config_) + remote_cost :
+        unavailable_cost();
 
     switch (policy) {
         case RoutingPolicy::ForceCpu:
+            require_endpoint(config_, metadata, EndpointKind::CPU, "CPU");
             return annotate_costs(
                 make_cpu_plan(metrics.work_units, cpu_cost, metadata, config_),
                 cpu_cost,
@@ -441,6 +571,7 @@ DispatchPlan Router::plan_saxpy(
                 remote_cost,
                 located_metrics);
         case RoutingPolicy::ForceGpu:
+            require_endpoint(config_, metadata, EndpointKind::GPU, "GPU");
             return annotate_costs(
                 make_gpu_plan(metrics.work_units, gpu_cost, metadata, config_),
                 cpu_cost,
@@ -450,6 +581,8 @@ DispatchPlan Router::plan_saxpy(
                 remote_cost,
                 located_metrics);
         case RoutingPolicy::ForceSplit:
+            require_endpoint(config_, metadata, EndpointKind::CPU, "CPU");
+            require_endpoint(config_, metadata, EndpointKind::GPU, "GPU");
             return annotate_costs(
                 make_split_plan(metrics.work_units, split_cost, metadata, config_),
                 cpu_cost,
@@ -459,6 +592,7 @@ DispatchPlan Router::plan_saxpy(
                 remote_cost,
                 located_metrics);
         case RoutingPolicy::ForceSim:
+            require_endpoint(config_, metadata, EndpointKind::SIM, "SIM");
             return annotate_costs(
                 make_sim_plan(metrics.work_units, sim_cost, metadata, config_),
                 cpu_cost,
@@ -485,6 +619,11 @@ DispatchPlan Router::plan_saxpy(
 
             if (sim_cost < best_plan.estimated_cost) {
                 best_plan = make_sim_plan(metrics.work_units, sim_cost, metadata, config_);
+            }
+
+            if (best_plan.estimated_cost == unavailable_cost()) {
+                throw std::invalid_argument(
+                    "No available endpoint can execute the SAXPY job");
             }
 
             return annotate_costs(

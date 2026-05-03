@@ -1,4 +1,4 @@
-CXX := g++
+CXX := mpicxx
 NVCC := nvcc
 AR := ar
 

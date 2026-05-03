@@ -1,5 +1,7 @@
 #include "kernels.h"
 
+#include <mpi.h>
+
 #include <stdexcept>
 
 namespace Routing
@@ -95,5 +97,61 @@ namespace Routing
                 }
             }
         }
+    }
+
+    void jacobi_exchange_halos_cpu(
+        std::size_t nx,
+        std::size_t owned_rows,
+        float* tile,
+        int node_id,
+        int neighbor_node_id)
+    {
+        if (tile == nullptr) {
+            throw std::invalid_argument("jacobi_exchange_halos_cpu received a null tile");
+        }
+
+        if (nx == 0 || owned_rows == 0 || neighbor_node_id < 0) {
+            return;
+        }
+
+        int initialized = 0;
+        MPI_Initialized(&initialized);
+        if (!initialized) {
+            throw std::runtime_error("MPI must be initialized before Jacobi halo exchange");
+        }
+
+        constexpr int upper_to_lower_tag = 100;
+        constexpr int lower_to_upper_tag = 101;
+
+        if (node_id < neighbor_node_id) {
+            MPI_Sendrecv(
+                tile + owned_rows * nx,
+                static_cast<int>(nx),
+                MPI_FLOAT,
+                neighbor_node_id,
+                upper_to_lower_tag,
+                tile + (owned_rows + 1) * nx,
+                static_cast<int>(nx),
+                MPI_FLOAT,
+                neighbor_node_id,
+                lower_to_upper_tag,
+                MPI_COMM_WORLD,
+                MPI_STATUS_IGNORE);
+            return;
+        }
+
+        MPI_Sendrecv(
+            tile + nx,
+            static_cast<int>(nx),
+            MPI_FLOAT,
+            neighbor_node_id,
+            lower_to_upper_tag,
+            tile,
+            static_cast<int>(nx),
+            MPI_FLOAT,
+            neighbor_node_id,
+            upper_to_lower_tag,
+            MPI_COMM_WORLD,
+            MPI_STATUS_IGNORE);
     }
 }
