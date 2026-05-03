@@ -129,6 +129,19 @@ inside the runtime and CPU kernel layer.
 rank/node identity, exchanges halo rows, and gathers final owned rows back to
 rank 0 for verification.
 
+This is the main boundary that preserves the design goal: application/example
+code expresses distributed Jacobi intent, while the runtime owns communication
+mechanics. The MPI-backed example can therefore be read as:
+
+```text
+rank-local logical node setup
+runtime-managed halo exchange
+normal routed job submission
+runtime-managed final gather
+```
+
+instead of as MPI plumbing.
+
 ### CPU MPI Halo Kernel
 
 Added `jacobi_exchange_halos_cpu(...)` in `src/kernels_cpu.cpp`. It performs the
@@ -162,9 +175,22 @@ fallback after emitting a trace.
 The table gives the runtime a real place to evolve data placement later without
 putting residency logic in examples.
 
-### Per-Logical-Node Queue Pressure
+Current behavior is intentionally host-conservative:
 
-Replaced the global runtime counters:
+```text
+CPU endpoint -> output tracked as Host
+GPU endpoint -> output tracked as Host, because wrapper copies D2H today
+SIM endpoint -> output tracked as Host, because SIM emits trace then CPU fallback runs
+halo exchange -> tile tracked as Host
+```
+
+The point of the table is not to claim GPU/SIM persistent residency yet. It is
+to make residency a runtime-owned concern so later endpoint wrappers can mark
+outputs as GPU or SIM without changing example code.
+
+### Rank-Local Queue Pressure
+
+The runtime now tracks endpoint queue pressure only for the current process:
 
 ```cpp
 g_cpu_jobs
@@ -172,21 +198,10 @@ g_gpu_jobs
 g_sim_jobs
 ```
 
-with a pressure table keyed by `target_node_id`:
-
-```cpp
-struct EndpointPressure {
-    std::size_t cpu_jobs = 0;
-    std::size_t gpu_jobs = 0;
-    std::size_t sim_jobs = 0;
-};
-
-std::unordered_map<int, EndpointPressure> g_endpoint_pressure;
-```
-
-This means node 0 and node 1 can have separate logical CPU/SIM pressure even
-inside one physical process. This is still a lightweight approximation, not a
-full scheduler.
+This is deliberate. In the MPI design, each rank owns one logical node, so a
+rank should not maintain queue state for endpoints that live on another rank.
+The router still logs `target_node_id`, but local endpoint pressure is
+rank-local.
 
 ### JSON Logging for Unavailable Costs
 
@@ -199,34 +214,50 @@ The runtime now logs unavailable endpoint costs as JSON `null` instead of
 
 This keeps JSONL output parseable and makes missing endpoints explicit.
 
-## New Example: Two Logical Nodes
+## Combined Example: Two Logical Nodes
 
-Added:
+The two Jacobi two-node drivers were collapsed into one MPI-backed example:
 
 ```text
 examples/jacobi_two_logical_nodes.cpp
 ```
 
+There is no longer a separate `examples/jacobi_two_logical_nodes_mpi.cpp`, and
+there is no single-process two-node driver that copies halos between two local
+node structs. All multi-node Jacobi communication now goes through
+`DistributedRuntime` and the CPU MPI halo kernel.
+
+Run it with:
+
+```bash
+mpirun -np 2 ./build/bin/jacobi_two_logical_nodes
+```
+
+Each rank owns exactly one logical node:
+
+```text
+rank 0 -> logical node 0 -> CPU0, optional GPU0, SIM0
+rank 1 -> logical node 1 -> CPU1, SIM1
+```
+
 The example:
 
 1. Builds a global Jacobi grid.
-2. Splits interior rows across two logical nodes.
-3. Gives each logical node a local tile with one ghost row on each side.
-4. Exchanges halos by copying rows between the two local tiles.
+2. Each rank derives its local row partition.
+3. Each rank builds one local tile with one ghost row on each side.
+4. Exchanges halos through `DistributedRuntime`.
 5. Routes interior jobs with `RoutingPolicy::Auto`.
 6. Forces boundary jobs to CPU.
 7. Swaps buffers each iteration.
-8. Gathers the final global grid.
+8. Gathers the final global grid through `DistributedRuntime`.
 9. Verifies against a sequential reference Jacobi implementation.
 
-The logical per-iteration flow is:
+The rank-local per-iteration flow is:
 
 ```text
-exchange_halos(node0, node1)
-route node0 JACOBI_INTERIOR with Auto
-route node1 JACOBI_INTERIOR with Auto
-route node0 JACOBI_BOUNDARY with ForceCpu
-route node1 JACOBI_BOUNDARY with ForceCpu
+runtime.exchange_jacobi_halos(...)
+route local JACOBI_INTERIOR with Auto
+route local JACOBI_BOUNDARY with ForceCpu
 swap local buffers
 ```
 
@@ -246,27 +277,6 @@ local nx = 64
 local ny = 18
 interior work units = (64 - 2) * (18 - 2) = 992
 boundary work units = 160
-```
-
-## New MPI Example
-
-Added:
-
-```text
-examples/jacobi_two_logical_nodes_mpi.cpp
-```
-
-This is the distributed version of the two-logical-node Jacobi test:
-
-```bash
-mpirun -np 2 ./build/bin/jacobi_two_logical_nodes_mpi
-```
-
-Each rank owns exactly one logical node:
-
-```text
-rank 0 -> logical node 0 -> CPU0, optional GPU0, SIM0
-rank 1 -> logical node 1 -> CPU1, SIM1
 ```
 
 The example still only expresses high-level runtime operations:
@@ -313,6 +323,35 @@ The important `node_kind` behavior is that each rank configures
 `RouterConfig::local_node_id` to its own logical node ID. Therefore rank-local
 jobs are planned as `Local`. If a rank submits a job for the other node, the
 router will label it `Remote` and apply remote cost.
+
+The runtime now rejects remote plans instead of executing them locally:
+
+```text
+Remote dispatch is not executable on this rank; submit the job on its owning rank
+```
+
+This removes the old prototype assumption that one process might execute
+endpoints for multiple logical nodes. Remote forwarding can be added later, but
+the current behavior is deliberately explicit.
+
+The MPI example generated separate per-rank logs:
+
+```text
+outputs/routing_jacobi_node0_run_log_<timestamp>.jsonl
+outputs/routing_jacobi_node1_run_log_<timestamp>.jsonl
+```
+
+Each log contains only that rank's local routed jobs. In the validated run,
+both node 0 and node 1 records had:
+
+```text
+node_kind: Local
+remote cost: 0
+```
+
+That is expected because each rank submitted work for itself. Cross-node work
+submission is represented as `Remote` by the router and rejected by the runtime
+until explicit forwarding exists.
 
 ## GPU Exposure
 
@@ -448,7 +487,7 @@ and CPU beats SIM for boundary.
 Command attempted:
 
 ```bash
-ROUTING_ENABLE_NODE0_GPU=1 ./build/bin/jacobi_two_logical_nodes
+ROUTING_ENABLE_NODE0_GPU=1 mpirun -np 2 ./build/bin/jacobi_two_logical_nodes
 ```
 
 The run failed on this machine because CUDA could not find a device, but the
@@ -483,9 +522,13 @@ After running:
 eval "$(conda shell.zsh hook)"
 conda activate drl
 python -m prototype.run_simpy \
-  --input outputs/sim_traces/routing_jacobi_two_node_sim_jobs.jsonl \
-  --output outputs/sim_traces/routing_jacobi_two_node_sim_results.jsonl \
-  --summary-output outputs/routing_jacobi_two_node_sim_summary.jsonl
+  --input outputs/sim_traces/routing_jacobi_node0_sim_jobs_<timestamp>.jsonl \
+  --output outputs/sim_traces/routing_jacobi_node0_sim_results_<timestamp>.jsonl \
+  --summary-output outputs/routing_jacobi_node0_sim_summary_<timestamp>.jsonl
+python -m prototype.run_simpy \
+  --input outputs/sim_traces/routing_jacobi_node1_sim_jobs_<timestamp>.jsonl \
+  --output outputs/sim_traces/routing_jacobi_node1_sim_results_<timestamp>.jsonl \
+  --summary-output outputs/routing_jacobi_node1_sim_summary_<timestamp>.jsonl
 ```
 
 The safe-default two-node run emitted 8 SIM jobs:
@@ -673,16 +716,10 @@ Build:
 make all
 ```
 
-Safe default two-node run:
-
-```bash
-./build/bin/jacobi_two_logical_nodes
-```
-
 MPI two-node run:
 
 ```bash
-mpirun -np 2 ./build/bin/jacobi_two_logical_nodes_mpi
+mpirun -np 2 ./build/bin/jacobi_two_logical_nodes
 ```
 
 In the current sandbox, `mpirun` needed elevated local socket permission to
@@ -694,9 +731,13 @@ SimPy replay:
 eval "$(conda shell.zsh hook)"
 conda activate drl
 python -m prototype.run_simpy \
-  --input outputs/sim_traces/routing_jacobi_two_node_sim_jobs.jsonl \
-  --output outputs/sim_traces/routing_jacobi_two_node_sim_results.jsonl \
-  --summary-output outputs/routing_jacobi_two_node_sim_summary.jsonl
+  --input outputs/sim_traces/routing_jacobi_node0_sim_jobs_<timestamp>.jsonl \
+  --output outputs/sim_traces/routing_jacobi_node0_sim_results_<timestamp>.jsonl \
+  --summary-output outputs/routing_jacobi_node0_sim_summary_<timestamp>.jsonl
+python -m prototype.run_simpy \
+  --input outputs/sim_traces/routing_jacobi_node1_sim_jobs_<timestamp>.jsonl \
+  --output outputs/sim_traces/routing_jacobi_node1_sim_results_<timestamp>.jsonl \
+  --summary-output outputs/routing_jacobi_node1_sim_summary_<timestamp>.jsonl
 ```
 
 Existing smoke checks:
@@ -709,20 +750,23 @@ python -m unittest prototype.test_sim_endpoint
 
 ## Next Suggested Step
 
-The next clean implementation step is to add a true two-rank MPI driver:
-
-```bash
-mpirun -np 2 ./build/bin/jacobi_mpi
-```
-
-Each rank would own one logical node:
+The two-rank MPI driver now exists. The next clean step is to make remote job
+submission forward to the owner rank:
 
 ```text
-rank 0 -> node 0 -> CPU0/GPU0/SIM0
-rank 1 -> node 1 -> CPU1/SIM1
+rank-local job -> execute locally
+remote job     -> forward to owning rank
 ```
 
-The current single-process example already has the logical partitioning,
-endpoint availability, routing, trace emission, and verification structure.
-An MPI version would replace the host row-copy halo exchange with real rank
-communication and give a clearer distributed-runtime story.
+After that, add merged evaluation tooling that combines:
+
+```text
+rank 0 routing log
+rank 1 routing log
+SIM0/SIM1 SimPy results
+halo exchange timing
+CPU/GPU measured timings
+```
+
+That would turn the current proof of concept into a cleaner routing evaluation
+pipeline.

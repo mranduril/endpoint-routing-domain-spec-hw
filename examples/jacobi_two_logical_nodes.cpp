@@ -11,6 +11,7 @@
 #include <iostream>
 #include <memory>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <sys/stat.h>
 #include <vector>
@@ -38,6 +39,17 @@ std::string run_timestamp()
     std::ostringstream out;
     out << std::put_time(&local_time, "%Y%m%d_%H%M%S");
     return out.str();
+}
+
+bool env_enabled(const char* name)
+{
+    const char* value = std::getenv(name);
+    if (value == nullptr) {
+        return false;
+    }
+
+    const std::string text(value);
+    return text == "1" || text == "true" || text == "TRUE" || text == "on";
 }
 
 float initial_value(std::size_t row, std::size_t col)
@@ -116,10 +128,16 @@ void load_node_from_global(
     *node.output = *node.input;
 }
 
-void exchange_halos(LogicalNode& node0, LogicalNode& node1)
+Routing::RouterConfig make_logical_node_config(
+    int local_node_id,
+    bool gpu_available)
 {
-    copy_row(*node0.input, node0.owned_rows, *node1.input, 0, node0.nx);
-    copy_row(*node1.input, 1, *node0.input, node0.owned_rows + 1, node0.nx);
+    Routing::RouterConfig config = Routing::make_router_config(
+        local_node_id,
+        Routing::CostModelPreset::SimPyAlignedStencil);
+    config.endpoint_availability[local_node_id] =
+        Routing::EndpointAvailability{true, gpu_available, true};
+    return config;
 }
 
 Routing::Job make_jacobi_job(
@@ -145,71 +163,39 @@ Routing::Job make_jacobi_job(
 }
 
 void route_iteration(
-    LogicalNode& node0,
-    LogicalNode& node1,
+    const Routing::DistributedRuntime& runtime,
+    LogicalNode& node,
     int iteration,
     std::size_t& next_job_id)
 {
-    exchange_halos(node0, node1);
-    *node0.output = *node0.input;
-    *node1.output = *node1.input;
+    runtime.exchange_jacobi_halos(
+        node.nx,
+        node.owned_rows,
+        *node.input,
+        node.neighbor_node_id);
+    *node.output = *node.input;
 
-    Routing::Request interior0 = Routing::submit(
+    Routing::Request interior = Routing::submit(
         make_jacobi_job(
-            node0,
+            node,
             Routing::WorkloadType::JACOBI_INTERIOR,
             next_job_id++,
             iteration),
         Routing::RoutingPolicy::Auto,
-        node0.router_config);
-    Routing::Request interior1 = Routing::submit(
-        make_jacobi_job(
-            node1,
-            Routing::WorkloadType::JACOBI_INTERIOR,
-            next_job_id++,
-            iteration),
-        Routing::RoutingPolicy::Auto,
-        node1.router_config);
-    interior0.wait();
-    interior1.wait();
+        node.router_config);
+    interior.wait();
 
-    Routing::Request boundary0 = Routing::submit(
+    Routing::Request boundary = Routing::submit(
         make_jacobi_job(
-            node0,
+            node,
             Routing::WorkloadType::JACOBI_BOUNDARY,
             next_job_id++,
             iteration),
         Routing::RoutingPolicy::ForceCpu,
-        node0.router_config);
-    Routing::Request boundary1 = Routing::submit(
-        make_jacobi_job(
-            node1,
-            Routing::WorkloadType::JACOBI_BOUNDARY,
-            next_job_id++,
-            iteration),
-        Routing::RoutingPolicy::ForceCpu,
-        node1.router_config);
-    boundary0.wait();
-    boundary1.wait();
+        node.router_config);
+    boundary.wait();
 
-    node0.input.swap(node0.output);
-    node1.input.swap(node1.output);
-}
-
-std::vector<float> gather_global(
-    const LogicalNode& node0,
-    const LogicalNode& node1,
-    const std::vector<float>& initial_global,
-    std::size_t nx)
-{
-    std::vector<float> global = initial_global;
-    for (std::size_t row = 0; row < node0.owned_rows; ++row) {
-        copy_row(*node0.input, row + 1, global, node0.start_global_row + row, nx);
-    }
-    for (std::size_t row = 0; row < node1.owned_rows; ++row) {
-        copy_row(*node1.input, row + 1, global, node1.start_global_row + row, nx);
-    }
-    return global;
+    node.input.swap(node.output);
 }
 
 bool verify(
@@ -231,33 +217,18 @@ bool verify(
     }
     return true;
 }
+}
 
-bool env_enabled(const char* name)
+int main(int argc, char** argv)
 {
-    const char* value = std::getenv(name);
-    if (value == nullptr) {
-        return false;
+    Routing::DistributedRuntime runtime(&argc, &argv);
+    if (runtime.size() != 2) {
+        if (runtime.rank() == 0) {
+            std::cerr << "Run with exactly two ranks for the two-node Jacobi example\n";
+        }
+        return 1;
     }
 
-    const std::string text(value);
-    return text == "1" || text == "true" || text == "TRUE" || text == "on";
-}
-
-Routing::RouterConfig make_logical_node_config(
-    int local_node_id,
-    bool gpu_available)
-{
-    Routing::RouterConfig config = Routing::make_router_config(
-        local_node_id,
-        Routing::CostModelPreset::SimPyAlignedStencil);
-    config.endpoint_availability[local_node_id] =
-        Routing::EndpointAvailability{true, gpu_available, true};
-    return config;
-}
-}
-
-int main()
-{
     constexpr std::size_t nx = 64;
     constexpr std::size_t ny = 34;
     constexpr int iterations = 4;
@@ -265,12 +236,15 @@ int main()
     mkdir("outputs", 0775);
     mkdir("outputs/sim_traces", 0775);
     const std::string timestamp = run_timestamp();
-    const char* trace_path = "outputs/sim_traces/routing_jacobi_two_node_sim_jobs.jsonl";
-    const std::string log_path = "outputs/routing_jacobi_two_node_run_log_" +
-        timestamp + ".jsonl";
+    const std::string trace_path =
+        "outputs/sim_traces/routing_jacobi_node" +
+        std::to_string(runtime.node_id()) + "_sim_jobs_" + timestamp + ".jsonl";
+    const std::string log_path =
+        "outputs/routing_jacobi_node" +
+        std::to_string(runtime.node_id()) + "_run_log_" + timestamp + ".jsonl";
     std::ofstream(trace_path, std::ios::trunc).close();
     std::ofstream(log_path, std::ios::trunc).close();
-    setenv("ROUTING_SIM_TRACE", trace_path, 1);
+    setenv("ROUTING_SIM_TRACE", trace_path.c_str(), 1);
     setenv("ROUTING_RUN_LOG", log_path.c_str(), 1);
 
     const std::vector<float> initial_global = make_initial_grid(nx, ny);
@@ -278,43 +252,52 @@ int main()
     const std::size_t node0_rows = interior_rows / 2;
     const std::size_t node1_rows = interior_rows - node0_rows;
 
-    LogicalNode node0;
-    node0.node_id = 0;
-    node0.neighbor_node_id = 1;
-    node0.start_global_row = 1;
-    node0.owned_rows = node0_rows;
-    node0.nx = nx;
-    const bool node0_gpu_available = env_enabled("ROUTING_ENABLE_NODE0_GPU");
-    node0.router_config = make_logical_node_config(0, node0_gpu_available);
-    load_node_from_global(node0, initial_global, ny);
+    LogicalNode node;
+    node.node_id = runtime.node_id();
+    node.neighbor_node_id = node.node_id == 0 ? 1 : 0;
+    node.start_global_row = node.node_id == 0 ? 1 : 1 + node0_rows;
+    node.owned_rows = node.node_id == 0 ? node0_rows : node1_rows;
+    node.nx = nx;
+    const bool node0_gpu_available =
+        node.node_id == 0 && env_enabled("ROUTING_ENABLE_NODE0_GPU");
+    node.router_config = make_logical_node_config(
+        node.node_id,
+        node0_gpu_available);
+    load_node_from_global(node, initial_global, ny);
 
-    LogicalNode node1;
-    node1.node_id = 1;
-    node1.neighbor_node_id = 0;
-    node1.start_global_row = 1 + node0_rows;
-    node1.owned_rows = node1_rows;
-    node1.nx = nx;
-    node1.router_config = make_logical_node_config(1, false);
-    load_node_from_global(node1, initial_global, ny);
-
-    std::size_t next_job_id = 1;
+    std::size_t next_job_id =
+        static_cast<std::size_t>(runtime.node_id()) * 2 + 1;
     for (int iter = 0; iter < iterations; ++iter) {
-        route_iteration(node0, node1, iter, next_job_id);
+        route_iteration(runtime, node, iter, next_job_id);
+        next_job_id += 2;
     }
 
-    const std::vector<float> actual = gather_global(node0, node1, initial_global, nx);
-    const std::vector<float> expected = run_reference(initial_global, nx, ny, iterations);
-    if (!verify(actual, expected)) {
-        std::cerr << "Two-logical-node Jacobi verification failed\n";
-        return 1;
+    const std::vector<float> actual = runtime.gather_jacobi_global(
+        *node.input,
+        nx,
+        node.owned_rows,
+        node.start_global_row,
+        ny,
+        initial_global);
+
+    if (runtime.rank() == 0) {
+        const std::vector<float> expected =
+            run_reference(initial_global, nx, ny, iterations);
+        if (!verify(actual, expected)) {
+            std::cerr << "MPI two-logical-node Jacobi verification failed\n";
+            return 1;
+        }
+
+        std::cout << "MPI two-logical-node Jacobi verification passed\n";
+        std::cout << "Logical node 0 endpoints: CPU0, "
+                  << (env_enabled("ROUTING_ENABLE_NODE0_GPU") ? "GPU0, " : "")
+                  << "SIM0\n";
+        std::cout << "Logical node 1 endpoints: CPU1, SIM1\n";
     }
 
-    std::cout << "Two-logical-node Jacobi verification passed\n";
-    std::cout << "Logical node 0 endpoints: CPU0, "
-              << (node0_gpu_available ? "GPU0, " : "")
-              << "SIM0\n";
-    std::cout << "Logical node 1 endpoints: CPU1, SIM1\n";
-    std::cout << "SIM trace emitted to " << trace_path << '\n';
-    std::cout << "Run log emitted to " << log_path << '\n';
+    std::cout << "Node " << runtime.node_id()
+              << " SIM trace emitted to " << trace_path << '\n';
+    std::cout << "Node " << runtime.node_id()
+              << " run log emitted to " << log_path << '\n';
     return 0;
 }

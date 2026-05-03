@@ -22,14 +22,10 @@ namespace Routing
 {
 namespace
 {
-struct EndpointPressure {
-    std::size_t cpu_jobs = 0;
-    std::size_t gpu_jobs = 0;
-    std::size_t sim_jobs = 0;
-};
-
 std::mutex g_pressure_mutex;
-std::unordered_map<int, EndpointPressure> g_endpoint_pressure;
+std::size_t g_cpu_jobs = 0;
+std::size_t g_gpu_jobs = 0;
+std::size_t g_sim_jobs = 0;
 std::mutex g_data_location_mutex;
 std::unordered_map<const void*, DataLocation> g_data_locations;
 
@@ -245,21 +241,16 @@ void write_dispatch_plan_json_fields(std::ostream& out, const DispatchPlan& plan
     write_plan_ranges_json(out, plan);
 }
 
-RouterConfig runtime_router_config(
-    RouterConfig base_config,
-    int target_node_id)
+RouterConfig runtime_router_config(RouterConfig base_config)
 {
-    // Snapshot queue pressure at planning time. Pressure is keyed by logical
-    // target node so a two-logical-node run can model CPU0/SIM0 separately from
-    // CPU1/SIM1 even when both live inside one physical process.
+    // Snapshot rank-local endpoint pressure at planning time. In multi-node
+    // runs each MPI rank owns one logical node, so the runtime should not model
+    // queues for endpoints that live on another rank.
     RouterConfig config = std::move(base_config);
     std::lock_guard<std::mutex> lock(g_pressure_mutex);
-    const auto it = g_endpoint_pressure.find(target_node_id);
-    if (it != g_endpoint_pressure.end()) {
-        config.queued_cpu_jobs += it->second.cpu_jobs;
-        config.queued_gpu_jobs += it->second.gpu_jobs;
-        config.queued_sim_jobs += it->second.sim_jobs;
-    }
+    config.queued_cpu_jobs += g_cpu_jobs;
+    config.queued_gpu_jobs += g_gpu_jobs;
+    config.queued_sim_jobs += g_sim_jobs;
     return config;
 }
 
@@ -269,20 +260,19 @@ void increment_pressure(const DispatchPlan& plan)
     // pressure. The next planning decision sees currently running work and can
     // bias away from a busy endpoint.
     std::lock_guard<std::mutex> lock(g_pressure_mutex);
-    EndpointPressure& pressure = g_endpoint_pressure[plan.target_node_id];
     switch (plan.kind) {
         case DispatchKind::CpuOnly:
-            ++pressure.cpu_jobs;
+            ++g_cpu_jobs;
             break;
         case DispatchKind::GpuOnly:
-            ++pressure.gpu_jobs;
+            ++g_gpu_jobs;
             break;
         case DispatchKind::CpuGpuSplit:
-            ++pressure.cpu_jobs;
-            ++pressure.gpu_jobs;
+            ++g_cpu_jobs;
+            ++g_gpu_jobs;
             break;
         case DispatchKind::SimOnly:
-            ++pressure.sim_jobs;
+            ++g_sim_jobs;
             break;
     }
 }
@@ -290,20 +280,19 @@ void increment_pressure(const DispatchPlan& plan)
 void decrement_pressure(const DispatchPlan& plan)
 {
     std::lock_guard<std::mutex> lock(g_pressure_mutex);
-    EndpointPressure& pressure = g_endpoint_pressure[plan.target_node_id];
     switch (plan.kind) {
         case DispatchKind::CpuOnly:
-            --pressure.cpu_jobs;
+            --g_cpu_jobs;
             break;
         case DispatchKind::GpuOnly:
-            --pressure.gpu_jobs;
+            --g_gpu_jobs;
             break;
         case DispatchKind::CpuGpuSplit:
-            --pressure.cpu_jobs;
-            --pressure.gpu_jobs;
+            --g_cpu_jobs;
+            --g_gpu_jobs;
             break;
         case DispatchKind::SimOnly:
-            --pressure.sim_jobs;
+            --g_sim_jobs;
             break;
     }
 }
@@ -625,8 +614,12 @@ Request submit(Job job, RoutingPolicy policy, RouterConfig config)
 
     // Planning happens synchronously so callers can inspect/log the selected
     // dispatch immediately, while actual endpoint work runs asynchronously.
-    Router router(runtime_router_config(std::move(config), state->job.metadata.node_id));
+    Router router(runtime_router_config(std::move(config)));
     state->plan = router.plan(state->job, policy);
+    if (state->plan.node_kind == NodeKind::Remote) {
+        throw std::invalid_argument(
+            "Remote dispatch is not executable on this rank; submit the job on its owning rank");
+    }
     write_routing_log(state->job, policy, state->plan);
     increment_pressure(state->plan);
     state->status = RequestStatus::Running;
